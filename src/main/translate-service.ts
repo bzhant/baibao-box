@@ -5,7 +5,7 @@ import { initPlatform, closePlatform, dbPath } from '@platform/init';
 import { restoreAll } from '@platform/patch';
 import { runPipeline, type PipelineProgress, type PipelineReport } from '../pipeline/translate-pipeline';
 import { createOpenAICompatibleProvider } from '../translate/providers/openai-compatible';
-import { getApiKey, getConfig } from '@platform/config';
+import { activeProfile, getProfileKey, listProfiles } from '@platform/config';
 import { logError, logInfo, logWarn } from '@platform/logbus';
 import type {
   TranslationProvider,
@@ -52,42 +52,106 @@ export const stubProvider: TranslationProvider = {
 /**
  * 选 Provider。
  *
- * ★ 两个原则：
- *   ① **不做隐式联网**：只有"界面上配了密钥"或"显式指定 openai"才会走真机翻。
- *      没配就用本地假机翻，并在日志与界面上说明 —— 绝不偷偷把文本发出去。
- *   ② 密钥来源优先级：**界面配置 > 环境变量**。
+ * ★ 三个原则：
+ *   ① **不做隐式联网**：只有"这套方案配了密钥"才会走真机翻；没配就用本地假机翻，
+ *      并在日志与界面上说明 —— 绝不偷偷把文本发出去。
+ *   ② **密钥来源优先级：界面配置 > 环境变量**。
  *      环境变量优先会让"用户在界面里改了密钥却不生效"变成很难解释的怪现象；
- *      反过来则是可预期的（命令行传的环境变量仍然能用，只是界面配置优先）。
+ *      反过来是可预期的（命令行传的环境变量仍能用，只是界面里配的优先）。
+ *   ③ **方案可切换**：不同游戏的文本量/语言对不同，"哪家便宜用哪家"是实际需求。
  *
- * ⚠️ 这里**不再用模块级的 `openAIProvider` 单例** —— 那个是在 import 时读环境变量
- *    构造的，界面里改的配置对它无效。改成运行时用配置构造。
+ * `profileId` 的三种取值：
+ *   · 不传        → 用**当前启用的方案**（界面上选的那套）
+ *   · `'stub'`    → 本地假机翻（只验证流程）
+ *   · 某个方案 id → 用那套（命令行 `--provider <id>`）
+ *
+ * ⚠️ 这里**不再用模块级单例** —— 那种在 import 时读环境变量构造的 provider
+ *    对界面里改的配置无效。改成每次按当前配置构造。
  */
-export function pickProvider(providerId?: string): { provider: TranslationProvider; autoStub: boolean } {
-  const cfg = getConfig();
-  const key = getApiKey() || process.env['BAIBAO_OPENAI_API_KEY'] || '';
-  const wantOpenAI = providerId === 'openai' || (!providerId && !!key);
+export interface PickedProvider {
+  provider: TranslationProvider;
+  /** 是否退化成了"本地假机翻" */
+  autoStub: boolean;
+  /** 展示用：用的是哪套方案 */
+  profileName: string;
+}
 
-  if (wantOpenAI && key) {
-    logInfo('provider', `使用 OpenAI 兼容接口：${cfg.openaiBaseUrl} / ${cfg.openaiModel}`);
+export function pickProvider(profileId?: string): PickedProvider {
+  if (profileId === 'stub') {
+    logInfo('provider', '显式指定 stub：使用本地假机翻（只验证流程，不做真翻译）');
+    return { provider: stubProvider, autoStub: true, profileName: stubProvider.displayName };
+  }
+
+  const wanted = profileId
+    ? listProfiles().find((p) => p.id === profileId) ?? null
+    : activeProfile();
+  if (!wanted) {
+    logWarn('provider', `指定的方案 "${profileId}" 不存在，回退到本地假机翻`);
+    return { provider: stubProvider, autoStub: true, profileName: stubProvider.displayName };
+  }
+
+  // 密钥：界面配置优先，环境变量兜底（老命令行脚本仍能用）
+  const key = getProfileKey(wanted.id) || process.env['BAIBAO_OPENAI_API_KEY'] || '';
+  if (!key) {
+    logWarn(
+      'provider',
+      `方案「${wanted.name}」没有配置密钥，回退到本地假机翻（译文形如【中】原文，只用于验证流程）`,
+    );
+    return { provider: stubProvider, autoStub: true, profileName: wanted.name };
+  }
+
+  logInfo('provider', `使用方案「${wanted.name}」：${wanted.baseUrl} / ${wanted.model}`);
+  return {
+    provider: createOpenAICompatibleProvider({
+      id: wanted.id,
+      displayName: wanted.name,
+      baseUrl: wanted.baseUrl,
+      apiKey: key,
+      model: wanted.model,
+      offline: false,
+    }),
+    autoStub: false,
+    profileName: wanted.name,
+  };
+}
+
+/**
+ * **测试一套方案**：真发一次最小的翻译请求。
+ *
+ * 为什么不是"检查有没有填密钥"：填了密钥但地址写错、模型名不存在、中转站没开、
+ * 余额不足 —— 这些都会在真跑整局游戏翻到一半时才炸，代价是几十次无用请求 + 用户白等。
+ * 用一句"こんにちは"试一次，几秒内就能把问题暴露在配置页上。
+ */
+export async function testProfile(profileId: string): Promise<{
+  ok: boolean;
+  detail: string;
+  ms: number;
+  providerName: string;
+}> {
+  const started = Date.now();
+  const { provider, autoStub, profileName } = pickProvider(profileId);
+  if (autoStub) {
     return {
-      provider: createOpenAICompatibleProvider({
-        id: 'openai',
-        displayName: 'OpenAI',
-        baseUrl: cfg.openaiBaseUrl,
-        apiKey: key,
-        model: cfg.openaiModel,
-        offline: false,
-      }),
-      autoStub: false,
+      ok: false,
+      detail: '这套方案没有可用的密钥（填一把再测）',
+      ms: Date.now() - started,
+      providerName: profileName,
     };
   }
-  if (wantOpenAI && !key) {
-    // 明确要求用 openai 却没密钥：说清楚，别静默降级成假机翻
-    logWarn('provider', '指定了 openai 但没有可用的 API Key，回退到本地假机翻');
-    return { provider: stubProvider, autoStub: true };
+  try {
+    const out = await provider.translate([
+      { id: 'probe', source: 'こんにちは', from: 'ja', to: 'zh-CN' },
+    ]);
+    const text = out[0]?.translated ?? '';
+    const ms = Date.now() - started;
+    if (!text || text === 'こんにちは') {
+      // 通了但没翻出来：多半是模型名/返回格式的问题 —— 如实说，别报"成功"
+      return { ok: false, detail: `接口通了，但没拿到译文（返回：${text || '空'}）`, ms, providerName: profileName };
+    }
+    return { ok: true, detail: `通了：こんにちは → ${text}`, ms, providerName: profileName };
+  } catch (e) {
+    return { ok: false, detail: (e as Error).message, ms: Date.now() - started, providerName: profileName };
   }
-  logInfo('provider', '未配置 API Key，使用本地假机翻（只验证流程，不做真翻译）');
-  return { provider: stubProvider, autoStub: !providerId };
 }
 
 /** 游戏目录 → 稳定的 gameId（同一目录重复汉化会命中同一条记录） */

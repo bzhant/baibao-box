@@ -24,6 +24,10 @@ const CH = {
   cfgStatus: 'bb:cfg-status',
   cfgUpdate: 'bb:cfg-update',
   cfgSetKey: 'bb:cfg-set-key',
+  cfgProfileSave: 'bb:cfg-profile-save',
+  cfgProfileDelete: 'bb:cfg-profile-delete',
+  cfgProfileActivate: 'bb:cfg-profile-activate',
+  cfgProfileTest: 'bb:cfg-profile-test',
   logs: 'bb:logs',
   logsClear: 'bb:logs-clear',
   wbList: 'bb:wb-list',
@@ -133,8 +137,21 @@ const api = {
     ipcRenderer.invoke(CH.cfgUpdate, patch),
 
   /** 设置或清除 API Key（空串 = 清除） */
-  cfgSetKey: (key: string): Promise<IpcResult<{ encrypted: boolean }>> =>
-    ipcRenderer.invoke(CH.cfgSetKey, key),
+  /** 给**指定方案**写密钥（只进不出：写进去之后界面读不回来） */
+  cfgSetKey: (profileId: string, key: string): Promise<IpcResult<{ encrypted: boolean }>> =>
+    ipcRenderer.invoke(CH.cfgSetKey, profileId, key),
+  /** 新增/修改一套接口方案 */
+  cfgProfileSave: (p: Record<string, unknown>): Promise<IpcResult<unknown>> =>
+    ipcRenderer.invoke(CH.cfgProfileSave, p),
+  /** 删除一套方案（只剩一套时会拒绝） */
+  cfgProfileDelete: (id: string): Promise<IpcResult<unknown>> =>
+    ipcRenderer.invoke(CH.cfgProfileDelete, id),
+  /** 切换当前启用的方案 */
+  cfgProfileActivate: (id: string): Promise<IpcResult<unknown>> =>
+    ipcRenderer.invoke(CH.cfgProfileActivate, id),
+  /** 测试一套方案：真发一句去测（不是"看有没有填密钥"） */
+  cfgProfileTest: (id: string): Promise<IpcResult<unknown>> =>
+    ipcRenderer.invoke(CH.cfgProfileTest, id),
 
   // ── 日志（打包后的应用没有终端，这些是用户唯一能看到的线索）──
 

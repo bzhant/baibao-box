@@ -55,10 +55,16 @@ interface CfgView {
   secretEncrypted: boolean;
   path: string;
   config: {
-    openaiBaseUrl: string; openaiModel: string;
+    activeProfileId: string;
     defaultFrom: string; defaultTo: string;
     batchSize: number; concurrency: number; backupBeforeRepack: boolean;
   };
+  /** 接口方案（多套） */
+  profiles: Array<{
+    id: string; name: string; baseUrl: string; model: string; preset: string;
+    hasKey: boolean; encrypted: boolean; isActive: boolean;
+  }>;
+  activeProfile: { id: string; name: string; baseUrl: string; model: string };
 }
 
 interface EngineManifestView {
@@ -112,8 +118,15 @@ interface BaiBaoApi {
   pickGameDir(): Promise<IpcResult<string | null>>;
   detect(d: string): Promise<IpcResult<EngineInfo>>;
   startTranslate(o: Record<string, unknown>): Promise<IpcResult<{ started: true }>>;
-  /** 一键汉化：装桥 → 启动游戏 → 边玩边翻（关闭游戏即自动还原） */
+  /** 把拖进来的路径折算成游戏目录（拖 Game.exe 或拖文件夹都认） */
   adoptPath(p: string): Promise<IpcResult<string>>;
+  /** 给指定方案写密钥（只进不出） */
+  cfgSetKey(profileId: string, key: string): Promise<IpcResult<{ encrypted: boolean }>>;
+  /** 接口方案的增删改查 */
+  cfgProfileSave(p: Record<string, unknown>): Promise<IpcResult<unknown>>;
+  cfgProfileDelete(id: string): Promise<IpcResult<unknown>>;
+  cfgProfileActivate(id: string): Promise<IpcResult<unknown>>;
+  cfgProfileTest(id: string): Promise<IpcResult<unknown>>;
   runtimeStart(gameDir: string): Promise<IpcResult<unknown>>;
   /** 收尾：结束游戏 + 逐字节还原游戏文件 */
   runtimeStop(): Promise<IpcResult<unknown>>;
@@ -265,6 +278,8 @@ export default function App(): React.ReactElement {
   const [error, setError] = React.useState('');
 
   const [env, setEnv] = React.useState<{ dbPath: string; hasApiKey: boolean } | null>(null);
+  /** 当前启用的接口方案名（方案可切换，界面上要如实显示用的哪个） */
+  const [profileName, setProfileName] = React.useState('');
   /** 所有引擎的声明式配置（界面据此自适应） */
   const [engines, setEngines] = React.useState<EngineManifestView[]>([]);
   /** 默认翻译方向只从配置应用一次，之后以用户当前选择为准 */
@@ -300,6 +315,7 @@ export default function App(): React.ReactElement {
           dbPath: env?.dbPath ?? '',
           hasApiKey: c.hasApiKey,
         });
+        setProfileName(c.activeProfile?.name ?? '');
         if (!appliedDefaults.current) {
           appliedDefaults.current = true;
           if (c.config.defaultFrom) setFrom(c.config.defaultFrom);
@@ -489,8 +505,10 @@ export default function App(): React.ReactElement {
   }, [rtRunning]);
 
   const busy = running || detecting;
+  // 方案是"名字 + 地址 + 模型"，所以显示当前启用的**方案名** —— 比只显示 providerId 有用
+  const activeProfileName = profileName || '（未读取配置）';
   const effectiveProvider = providerId === 'auto'
-    ? (env?.hasApiKey ? 'openai（检测到 API Key）' : 'stub 本地假机翻（未检测到 API Key）')
+    ? (env?.hasApiKey ? `${activeProfileName}（已配置密钥）` : `stub 本地假机翻（方案「${activeProfileName}」未填密钥）`)
     : providerId;
 
   return (

@@ -3,7 +3,18 @@ import { existsSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { registerBuiltinPlugins } from './bootstrap-plugins';
 import { registry } from '@platform/plugin-registry';
-import { configStatus, hasApiKey as hasApiKeyCfg, setApiKey, updateConfig, type AppConfig } from '@platform/config';
+import {
+  activateProfile,
+  configStatus,
+  deleteProfileById,
+  hasApiKey as hasApiKeyCfg,
+  listProfiles,
+  saveProfile,
+  setProfileKey,
+  updateConfig,
+  type AppConfig,
+  type ApiProfile,
+} from '@platform/config';
 import { clearLogs, listLogs, logInfo, logScopes, type LogLevel } from '@platform/logbus';
 import { initPlatform, dbPath } from '@platform/init';
 import {
@@ -19,7 +30,7 @@ import {
   startRuntime,
   stopRuntime,
 } from './runtime-service';
-import { pickProvider } from './translate-service';
+import { pickProvider, testProfile } from './translate-service';
 import {
   previewRepack,
   repackGame,
@@ -63,6 +74,10 @@ export const IPC = {
   logsClear: 'bb:logs-clear',
   // ── 一键汉化（运行时）──
   adoptPath: 'bb:adopt-path',
+  cfgProfileSave: 'bb:cfg-profile-save',
+  cfgProfileDelete: 'bb:cfg-profile-delete',
+  cfgProfileActivate: 'bb:cfg-profile-activate',
+  cfgProfileTest: 'bb:cfg-profile-test',
   runtimeStart: 'bb:runtime-start',
   runtimeStop: 'bb:runtime-stop',
   runtimeStatus: 'bb:runtime-status',
@@ -195,7 +210,7 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
       const p = (patch ?? {}) as Partial<AppConfig>;
       // 只接受已知字段，别让渲染层往配置里塞任意东西
       const allowed: Array<keyof AppConfig> = [
-        'openaiBaseUrl', 'openaiModel', 'defaultFrom', 'defaultTo',
+        'defaultFrom', 'defaultTo',
         'batchSize', 'concurrency', 'backupBeforeRepack',
       ];
       const clean: Partial<AppConfig> = {};
@@ -208,20 +223,66 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
     }
   });
 
-  ipcMain.handle(IPC.cfgSetKey, async (_e, key: unknown): Promise<IpcResult<{ encrypted: boolean }>> => {
+  ipcMain.handle(IPC.cfgSetKey, async (_e, profileId: unknown, key: unknown): Promise<IpcResult<{ encrypted: boolean }>> => {
+    if (typeof profileId !== 'string' || profileId.length === 0) return err(new Error('需要方案 id'));
+    if (typeof key !== 'string') return err(new Error('密钥必须是字符串'));
     try {
-      if (typeof key !== 'string') return err('密钥必须是字符串');
-      const r = setApiKey(key.trim());
-      logInfo('config', key.trim() ? `已保存 API Key（${r.encrypted ? '已加密' : '⚠ 明文'}）` : '已清除 API Key');
-      return ok(r);
+      // 密钥**只进不出**：这里只写入/清除，永不回读给渲染层
+      return ok(setProfileKey(profileId, key));
     } catch (e) {
       return err(e);
     }
   });
 
+
   // ── 日志 ────────────────────────────────────────────────────────────
   //
   // 打包后的应用**没有终端** —— 这些日志是用户唯一能看到"刚才发生了什么"的地方。
+  // ── 接口方案（多套，可切换）──────────────────────────────────────
+  //
+  // 为什么要多套：不同游戏的文本量/语言对不同，"哪家便宜用哪家"是很实际的需求；
+  // 每套方案各存各的密钥，换方案不用重新粘密钥。
+  ipcMain.handle(IPC.cfgProfileSave, async (_e, raw: unknown): Promise<IpcResult<unknown>> => {
+    try {
+      const p = (raw ?? {}) as Partial<ApiProfile> & { id?: string };
+      const saved = saveProfile(p);
+      return ok({ saved, profiles: listProfiles() });
+    } catch (e) {
+      return err(e);
+    }
+  });
+
+  ipcMain.handle(IPC.cfgProfileDelete, async (_e, id: unknown): Promise<IpcResult<unknown>> => {
+    if (typeof id !== 'string') return err(new Error('需要方案 id'));
+    try {
+      const r = deleteProfileById(id);
+      if (!r.ok) return { ok: false, error: r.error ?? '删除失败' };
+      return ok({ profiles: listProfiles(), activeProfileId: r.activeProfileId });
+    } catch (e) {
+      return err(e);
+    }
+  });
+
+  ipcMain.handle(IPC.cfgProfileActivate, async (_e, id: unknown): Promise<IpcResult<unknown>> => {
+    if (typeof id !== 'string') return err(new Error('需要方案 id'));
+    try {
+      activateProfile(id);
+      return ok({ profiles: listProfiles() });
+    } catch (e) {
+      return err(e);
+    }
+  });
+
+  ipcMain.handle(IPC.cfgProfileTest, async (_e, id: unknown): Promise<IpcResult<unknown>> => {
+    if (typeof id !== 'string') return err(new Error('需要方案 id'));
+    try {
+      // 真发一句去测（见 translate-service.testProfile 的注释：为什么不是"看有没有填密钥"）
+      return ok(await testProfile(id));
+    } catch (e) {
+      return err(e);
+    }
+  });
+
   ipcMain.handle(IPC.logs, async (_e, opts: unknown): Promise<IpcResult<unknown>> => {
     try {
       const o = (opts ?? {}) as { limit?: number; level?: LogLevel; scope?: string };
@@ -389,13 +450,8 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
       return { ok: false, error: '需要游戏目录' };
     }
     try {
-      const { provider, autoStub } = pickProvider(undefined);
-      const r = await startRuntime({
-        gameDir,
-        provider,
-        providerName: provider.displayName,
-        autoStub,
-      });
+      const { provider, autoStub, profileName } = pickProvider(undefined);
+      const r = await startRuntime({ gameDir, provider, providerName: profileName, autoStub });
       logInfo('ipc', `一键汉化已启动：${r.engine} · ${r.providerName}`);
       return { ok: true, data: r };
     } catch (e) {

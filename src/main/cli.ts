@@ -171,13 +171,8 @@ export async function runCli(argv: readonly string[]): Promise<number> {
     }
     if (args.runtime) {
       // Provider 在**这里**解析（命令行与界面各自解析，服务只负责编排）
-      const { provider, autoStub } = pickProvider(args.provider);
-      const r = await startRuntime({
-        gameDir: args.runtime,
-        provider,
-        providerName: provider.displayName,
-        autoStub,
-      });
+      const { provider, autoStub, profileName } = pickProvider(args.provider);
+      const r = await startRuntime({ gameDir: args.runtime, provider, providerName: profileName, autoStub });
       console.log('\n──── 运行时汉化（一键）────────────────');
       console.log(`  引擎            ${r.engine}（运行时桥）`);
       console.log(`  翻译接口        ${r.providerName}${r.autoStub ? '  ⚠ 没配密钥，降级为本地假机翻' : ''}`);
