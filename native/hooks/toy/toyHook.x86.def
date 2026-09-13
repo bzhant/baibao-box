@@ -1,0 +1,5 @@
+; x86（32 位）专用：stdcall 会修饰成 _Install@4，这里把它**别名**成干净名字。
+; 注入器统一用 GetProcAddress(h, "Install")，两边架构名字一致，少一类"注不进去"的坑。
+EXPORTS
+    Install=_Install@4
+    Uninstall=_Uninstall@0
