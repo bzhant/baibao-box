@@ -8,8 +8,10 @@ import {
   runTranslate,
   dbPath,
   pickProvider,
+  testProfile,
   type TranslateOutcome,
 } from './translate-service';
+import { listProfiles } from '@platform/config';
 import type { PipelineProgress } from '../pipeline/translate-pipeline';
 import {
   cleanupGameDir,
@@ -61,6 +63,8 @@ interface CliArgs {
   runtime?: string;
   /** 万一异常退出，把游戏目录收干净 */
   runtimeRestore?: string;
+  /** 接口自检：真发一句测当前（或指定）方案，打印结果后退出 */
+  testApi?: string | true;
   help: boolean;
 }
 
@@ -84,6 +88,12 @@ export function parseArgs(argv: readonly string[]): CliArgs {
       case '--provider': args.provider = next(); break;
       case '--runtime': args.runtime = next(); break;
       case '--runtime-restore': args.runtimeRestore = next(); break;
+      case '--test-api': {
+        // 可带方案 id，也可不带（不带就用当前启用的那套）
+        const v = argv[i + 1];
+        args.testApi = v && !v.startsWith('--') ? (i++, v) : true;
+        break;
+      }
       case '--help':
       case '-h': args.help = true; break;
       default: break;
@@ -108,6 +118,10 @@ const HELP = `
   --from <lang>     源语言，默认 ja
   --to <lang>       目标语言，默认 zh-CN
   --provider <id>   openai | stub（默认：有 BAIBAO_OPENAI_API_KEY 用 openai，否则 stub）
+
+接口自检：
+  --test-api [方案id]      真发一句"こんにちは"测接口，打印结果与耗时后退出
+                           （不带方案 id = 测当前启用的那套；用来排查"为什么连不上"）
 
 运行时汉化（一键，MV/MZ）：
   --runtime <目录>         装桥 → 启动游戏 → 边玩边翻 → **关闭游戏即自动还原**
@@ -160,6 +174,30 @@ export async function runCli(argv: readonly string[]): Promise<number> {
   registerBuiltinPlugins(); // 幂等
 
   try {
+    // ── 接口自检：真发一句，把结果打出来（排查"为什么连不上"最省事的一条路）──
+    if (args.testApi) {
+      const wanted = args.testApi === true ? undefined : args.testApi;
+      const profile = listProfiles().find((p) => (wanted ? p.id === wanted : p.isActive));
+      if (wanted && !profile) {
+        console.error(`✗ 找不到方案 "${wanted}"。可用方案：`);
+        for (const p of listProfiles()) console.error(`    ${p.id}  ${p.name}  ${p.baseUrl}  ${p.hasKey ? '(有密钥)' : '(无密钥)'}`);
+        return 2;
+      }
+      console.log('── 接口自检 ──────────────────────────');
+      for (const p of listProfiles()) {
+        console.log(
+          `  ${p.isActive ? '●' : '○'} ${p.id.padEnd(10)} ${p.name.padEnd(12)} ${p.baseUrl.padEnd(34)} ` +
+            `${p.model.padEnd(18)} 密钥=${p.hasKey ? (p.encrypted ? '有(加密)' : '有(明文)') : '无'}`,
+        );
+      }
+      const targetId = profile?.id ?? '';
+      console.log(`\n  测试方案：${profile?.name ?? '(无)'}（${targetId}）`);
+      const r = await testProfile(targetId);
+      console.log(`  ${r.ok ? '✓' : '✗'} ${r.detail}`);
+      console.log(`  耗时 ${r.ms} ms`);
+      return r.ok ? 0 : 1;
+    }
+
     // ── 运行时汉化（一键）──
     //
     // 与静态改文件的分工见 runtime-service.ts：这条**不改游戏数据文件**，

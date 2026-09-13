@@ -121,6 +121,11 @@ export function pickProvider(profileId?: string): PickedProvider {
  * 为什么不是"检查有没有填密钥"：填了密钥但地址写错、模型名不存在、中转站没开、
  * 余额不足 —— 这些都会在真跑整局游戏翻到一半时才炸，代价是几十次无用请求 + 用户白等。
  * 用一句"こんにちは"试一次，几秒内就能把问题暴露在配置页上。
+ *
+ * ★ 失败要**分清是哪一类**，因为用户能做的事完全不同：
+ *   · 没密钥      → 去填一把
+ *   · 连不上      → 网络/代理问题，或者地址写错（这个必须说，否则用户会一直改密钥）
+ *   · 4xx/5xx     → 密钥错、模型名错、余额不足（把接口原话带出来）
  */
 export async function testProfile(profileId: string): Promise<{
   ok: boolean;
@@ -129,19 +134,18 @@ export async function testProfile(profileId: string): Promise<{
   providerName: string;
 }> {
   const started = Date.now();
+  const profile = listProfiles().find((p) => p.id === profileId) ?? null;
   const { provider, autoStub, profileName } = pickProvider(profileId);
   if (autoStub) {
     return {
       ok: false,
-      detail: '这套方案没有可用的密钥（填一把再测）',
+      detail: `方案「${profileName}」还没有密钥 —— 在下面填一把，再点「保存并测试」`,
       ms: Date.now() - started,
       providerName: profileName,
     };
   }
   try {
-    const out = await provider.translate([
-      { id: 'probe', source: 'こんにちは', from: 'ja', to: 'zh-CN' },
-    ]);
+    const out = await provider.translate([{ id: 'probe', source: 'こんにちは', from: 'ja', to: 'zh-CN' }]);
     const text = out[0]?.translated ?? '';
     const ms = Date.now() - started;
     if (!text || text === 'こんにちは') {
@@ -150,7 +154,22 @@ export async function testProfile(profileId: string): Promise<{
     }
     return { ok: true, detail: `通了：こんにちは → ${text}`, ms, providerName: profileName };
   } catch (e) {
-    return { ok: false, detail: (e as Error).message, ms: Date.now() - started, providerName: profileName };
+    const raw = (e as Error).message;
+    const ms = Date.now() - started;
+    const url = profile?.baseUrl ?? '(未知地址)';
+    // "连不上"和"密钥不对"是两类完全不同的故障，混在一起会让用户白改半天密钥
+    const networkish = /fetch failed|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|ECONNREFUSED|ECONNRESET|network|socket|timeout/i.test(raw);
+    if (networkish) {
+      return {
+        ok: false,
+        detail:
+          `连不上 ${url}（不是密钥问题）。常见原因：本机网络到不了这个域名（国内直连 OpenAI 官方地址通常不通）、` +
+          `地址写错、或需要代理。原始错误：${raw}`,
+        ms,
+        providerName: profileName,
+      };
+    }
+    return { ok: false, detail: raw, ms, providerName: profileName };
   }
 }
 

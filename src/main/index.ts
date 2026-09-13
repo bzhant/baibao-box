@@ -32,6 +32,7 @@ const NO_GPU_FLAGS = [
   '--disable-gpu', // 兼容显式传入（脚本里仍会带）
   '--game', '--restore', '--repack-only', '--help', '-h', // CLI 模式
   '--runtime', '--runtime-restore', // 一键汉化（运行时）
+  '--test-api', // 接口自检
   '--smoke-test', // 自动化自检
 ];
 if (process.argv.some((a) => NO_GPU_FLAGS.includes(a))) {
@@ -126,7 +127,7 @@ function createMainWindow(): BrowserWindow {
  * ★ 加新 CLI 参数时**记得同步这里**，否则那个参数会被当成 GUI 启动参数、
  *   静默地被忽略（程序照常开窗，用户以为参数没生效）。
  */
-const CLI_FLAGS = ['--game', '--restore', '--repack-only', '--help', '-h', '--runtime', '--runtime-restore'];
+const CLI_FLAGS = ['--game', '--restore', '--repack-only', '--help', '-h', '--runtime', '--runtime-restore', '--test-api'];
 const isCliMode = process.argv.some((a) => CLI_FLAGS.includes(a));
 
 // 关硬件加速的判定已在上方 `NO_GPU_FLAGS` 处统一处理（含 CLI / --smoke-test / --disable-gpu），

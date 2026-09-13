@@ -75,6 +75,8 @@ export default function Settings(): React.ReactElement {
   const [pDraft, setPDraft] = React.useState<{ name: string; baseUrl: string; model: string } | null>(null);
   const [key, setKey] = React.useState('');
   const [showNew, setShowNew] = React.useState(false);
+  /** 地址预设下拉当前选中项（只影响"填地址"这个动作，不落盘） */
+  const [presetPick, setPresetPick] = React.useState('');
   const [test, setTest] = React.useState<{ ok: boolean; detail: string; ms: number } | null>(null);
 
   const [busy, setBusy] = React.useState(false);
@@ -149,25 +151,6 @@ export default function Settings(): React.ReactElement {
     await load();
   };
 
-  const saveProfileNow = async (): Promise<void> => {
-    if (!pDraft) return;
-    setBusy(true);
-    setErr('');
-    setMsg('');
-    const cur = profiles.find((p) => p.id === editId);
-    const r = (await api.cfgProfileSave({
-      id: editId,
-      preset: cur?.preset ?? 'custom',
-      ...pDraft,
-    })) as Res<unknown>;
-    setBusy(false);
-    if (!r.ok) {
-      setErr(r.error ?? '保存方案失败');
-      return;
-    }
-    flash('方案已保存。');
-    await load();
-  };
 
   const removeProfile = async (p: ProfileView): Promise<void> => {
     if (!window.confirm(`删除方案「${p.name}」？（它保存的密钥也会一起删掉）`)) return;
@@ -179,6 +162,71 @@ export default function Settings(): React.ReactElement {
       return;
     }
     flash('已删除该方案。');
+    await load();
+  };
+
+  /** 选一个地址预设 → 直接把地址与模型填进去（用户也可自己改） */
+  const applyPreset = (presetId: string): void => {
+    setPresetPick(presetId);
+    const p = presets.find((x) => x.preset === presetId);
+    if (!p || !pDraft) return;
+    setPDraft({ ...pDraft, baseUrl: p.baseUrl, model: p.model });
+  };
+
+  /**
+   * **保存并测试**：一颗按钮把三件事做完。
+   *
+   * 为什么必须合一：之前"保存密钥"与"测试连接"是两个按钮，
+   * 用户粘了密钥直接点测试 → 测的是**旧密钥（或没有密钥）** → 报"没有可用的密钥"，
+   * 于是看起来像"我填了密钥但没用"。这类"步骤顺序陷阱"不该丢给用户去猜。
+   */
+  const saveAndTest = async (): Promise<void> => {
+    if (!editing || !pDraft) return;
+    setBusy(true);
+    setErr('');
+    setMsg('');
+    setTest(null);
+
+    // 1) 方案本身（地址/模型/名字）
+    const r1 = (await api.cfgProfileSave({
+      id: editing.id,
+      preset: presetPick || editing.preset,
+      ...pDraft,
+    })) as Res<unknown>;
+    if (!r1.ok) {
+      setBusy(false);
+      setErr(r1.error ?? '保存方案失败');
+      return;
+    }
+
+    // 2) 框里有密钥就先存下来（存完再测，测的就是刚填的这把）
+    let tail = '';
+    if (key.trim()) {
+      const r2 = (await api.cfgSetKey(editing.id, key)) as Res<{ encrypted: boolean }>;
+      if (!r2.ok) {
+        setBusy(false);
+        setErr(r2.error ?? '保存密钥失败');
+        return;
+      }
+      tail = key.trim().slice(-4);
+      setKey('');
+    }
+
+    // 3) 真发一句去测
+    const r3 = (await api.cfgProfileTest(editing.id)) as Res<{ ok: boolean; detail: string; ms: number }>;
+    setBusy(false);
+    if (!r3.ok || !r3.data) {
+      setErr(r3.error ?? '测试失败');
+      return;
+    }
+    setTest(r3.data);
+    if (tail) {
+      setMsg(
+        r3.data.ok
+          ? `已保存密钥（末尾 …${tail}）并测试通过。`
+          : `已保存密钥（末尾 …${tail}），但测试没通过 —— 见下方原因。`,
+      );
+    }
     await load();
   };
 
@@ -199,19 +247,6 @@ export default function Settings(): React.ReactElement {
     await load();
   };
 
-  const testConn = async (id: string): Promise<void> => {
-    setBusy(true);
-    setTest(null);
-    setErr('');
-    setMsg('');
-    const r = (await api.cfgProfileTest(id)) as Res<{ ok: boolean; detail: string; ms: number }>;
-    setBusy(false);
-    if (!r.ok || !r.data) {
-      setErr(r.error ?? '测试失败');
-      return;
-    }
-    setTest(r.data);
-  };
 
   // ── 标量偏好 ──────────────────────────────────────────────────
 
@@ -255,26 +290,21 @@ export default function Settings(): React.ReactElement {
 
         <div className="row" style={{ marginTop: 12, flexWrap: 'wrap', gap: 8 }}>
           {profiles.map((p) => (
-            <span key={p.id} className="row" style={{ gap: 6, alignItems: 'center' }}>
-              <button
-                className={p.isActive ? 'primary' : ''}
-                disabled={busy}
-                title={p.isActive ? '当前启用' : '点一下切换为启用'}
-                onClick={() => void activate(p.id)}
-              >
-                {p.isActive ? '● ' : '○ '}
-                {p.name}
-                {p.hasKey ? '' : '（未填密钥）'}
-              </button>
-              <button
-                className="ghost"
-                disabled={busy}
-                title="编辑这套方案"
-                onClick={() => selectProfile(p)}
-              >
-                编辑
-              </button>
-            </span>
+            <button
+              key={p.id}
+              className={p.isActive ? 'primary' : ''}
+              disabled={busy}
+              title={p.isActive ? '当前启用（点一下展开它的设置）' : '点一下：切换为启用，并展开它的设置'}
+              onClick={() => {
+                // 点一下就"用它 + 展开它" —— 少一个"编辑"中间步骤，少一处误操作
+                void activate(p.id);
+                selectProfile(p);
+              }}
+            >
+              {p.isActive ? '● ' : '○ '}
+              {p.name}
+              {p.hasKey ? '' : '（未填密钥）'}
+            </button>
           ))}
           <button className="ghost" disabled={busy} onClick={() => setShowNew(!showNew)}>
             {showNew ? '收起' : '+ 新增方案'}
@@ -303,8 +333,8 @@ export default function Settings(): React.ReactElement {
 
         {editing && pDraft && (
           <div style={{ marginTop: 14, borderTop: '1px solid #2a323e', paddingTop: 12 }}>
-            <div className="row" style={{ gap: 8, alignItems: 'center' }}>
-              <span className="chip">正在编辑：{editing.name}</span>
+            <div className="row" style={{ gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+              <span className="chip">方案设置：{editing.name}</span>
               {editing.hasKey ? (
                 editing.encrypted ? (
                   <span className="chip ok">已配置密钥（已加密）</span>
@@ -314,24 +344,33 @@ export default function Settings(): React.ReactElement {
               ) : (
                 <span className="chip warn">未配置密钥</span>
               )}
+              {editing.isActive ? <span className="chip on">当前启用</span> : null}
               <div className="spacer" />
-              <button className="danger" disabled={busy || profiles.length <= 1} onClick={() => void removeProfile(editing)}>
+              <button
+                className="danger"
+                disabled={busy || profiles.length <= 1}
+                onClick={() => void removeProfile(editing)}
+              >
                 删除这套
               </button>
             </div>
 
+            {/* 地址：先给"常用地址"下拉，再给可自由编辑的输入框 —— 地址是要能改的，不该藏起来 */}
             <div className="grid2" style={{ marginTop: 12 }}>
               <div className="field">
-                <label>方案名（自己认得就行）</label>
-                <input
-                  type="text"
-                  value={pDraft.name}
-                  disabled={busy}
-                  onChange={(e) => setPDraft({ ...pDraft, name: e.target.value })}
-                />
+                <label>常用地址（选一个自动填，也可以自己改）</label>
+                <select value={presetPick} disabled={busy} onChange={(e) => applyPreset(e.target.value)}>
+                  <option value="">（不改，用下面已填的）</option>
+                  {presets.map((x) => (
+                    <option key={x.preset} value={x.preset}>
+                      {x.name}
+                      {x.baseUrl ? ` — ${x.baseUrl}` : ''}
+                    </option>
+                  ))}
+                </select>
               </div>
               <div className="field">
-                <label>接口地址（OpenAI 兼容端点，不带 /chat/completions）</label>
+                <label>接口地址 base URL（OpenAI 兼容端点）</label>
                 <input
                   type="text"
                   value={pDraft.baseUrl}
@@ -350,15 +389,25 @@ export default function Settings(): React.ReactElement {
                   onChange={(e) => setPDraft({ ...pDraft, model: e.target.value })}
                 />
               </div>
+              <div className="field">
+                <label>方案名（自己认得就行）</label>
+                <input
+                  type="text"
+                  value={pDraft.name}
+                  disabled={busy}
+                  onChange={(e) => setPDraft({ ...pDraft, name: e.target.value })}
+                />
+              </div>
             </div>
-            <div className="row" style={{ marginTop: 10 }}>
-              <button className="ghost" disabled={busy} onClick={() => void saveProfileNow()}>
-                保存方案
-              </button>
+            <div className="note" style={{ marginTop: 8 }}>
+              地址**只要到版本号为止**（通常以 <span className="mono">/v1</span> 结尾），
+              不要带 <span className="mono">/chat/completions</span>。
+              国内网络直连 <span className="mono">api.openai.com</span> 通常不通 ——
+              用 DeepSeek 或填中转站给你的地址。
             </div>
 
-            <div className="row" style={{ marginTop: 14 }}>
-              <div className="field" style={{ flex: 1, minWidth: 320 }}>
+            <div className="row" style={{ marginTop: 14, flexWrap: 'wrap' }}>
+              <div className="field" style={{ flex: 1, minWidth: 300 }}>
                 <label>API Key（留空则不修改；保存后界面上读不回来）</label>
                 <input
                   type="text"
@@ -368,20 +417,17 @@ export default function Settings(): React.ReactElement {
                   onChange={(e) => setKey(e.target.value)}
                 />
               </div>
-              <button className="primary" disabled={busy || !key.trim()} onClick={() => void saveKey(editing.id)}>
-                保存密钥
+              <button className="primary" disabled={busy} onClick={() => void saveAndTest()}>
+                保存并测试
               </button>
               <button className="ghost" disabled={busy || !editing.hasKey} onClick={() => void saveKey(editing.id, true)}>
-                清除
-              </button>
-              <button className="ghost" disabled={busy} onClick={() => void testConn(editing.id)}>
-                测试连接
+                清除密钥
               </button>
             </div>
             <div className="note" style={{ marginTop: 8 }}>
-              界面上**永远读不回**已保存的密钥，只能覆盖或清除。
-              「测试连接」会**真发一句**（こんにちは）去试 —— 比"看有没有填密钥"可靠：
-              地址写错、模型名不存在、余额不足，都能在这里当场发现，而不是翻到一半才炸。
+              「保存并测试」会把上面的地址/模型/方案名和这把密钥一起存下，然后**真发一句
+              こんにちは**去试 —— 不必再分两步点（先保存再测试容易让人误以为"填了没用"）。
+              粘贴密钥时若带上换行/空格，保存时会**自动去掉首尾空白**；中间夹着其它字符会被拒绝。
             </div>
             {test && (
               <div className={test.ok ? 'okbox' : 'errbox'} style={{ marginTop: 10 }}>

@@ -249,13 +249,21 @@ export function hasApiKey(): boolean {
 export function getProfileKey(profileId: string): string {
   const k = load().apiKeys[profileId];
   if (!k?.value) return '';
-  if (!k.encrypted) return k.value; // 降级存的明文
-  try {
-    return safeStorage.decryptString(Buffer.from(k.value, 'base64'));
-  } catch {
-    // 换机器/换用户后 DPAPI 解不开 —— 当作没配，而不是崩掉
-    return '';
+  let plain: string;
+  if (!k.encrypted) {
+    plain = k.value; // 降级存的明文
+  } else {
+    try {
+      plain = safeStorage.decryptString(Buffer.from(k.value, 'base64'));
+    } catch {
+      // 换机器/换用户后 DPAPI 解不开 —— 当作没配，而不是崩掉
+      return '';
+    }
   }
+  // ★ 一律去掉首尾空白。粘贴密钥时带上换行/空格是**最常见的故障**：
+  //   密钥看起来"填了"，但 `Bearer sk-xxx\n` 会被接口判为无效。
+  //   这里清洗，等于让已经存坏的那些密钥**自愈**，不用用户重新粘一遍。
+  return plain.trim();
 }
 
 /** 当前方案的密钥（provider 用这个） */
@@ -272,6 +280,12 @@ export function getApiKey(): string {
 export function setProfileKey(profileId: string, key: string): { encrypted: boolean } {
   const f = load();
   if (!f.config.profiles.some((p) => p.id === profileId)) throw new Error('找不到这套方案');
+  // 先清洗首尾空白；如果清洗后仍含空白，说明粘进来的不只是密钥（比如带上了说明文字）
+  const cleaned = key.trim();
+  if (cleaned && /\s/.test(cleaned)) {
+    throw new Error('密钥中间有空格或换行 —— 多半是粘贴时带上了别的内容，请只复制密钥本身');
+  }
+  key = cleaned;
   if (!key) {
     delete f.apiKeys[profileId];
     persist();
