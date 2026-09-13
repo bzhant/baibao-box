@@ -113,6 +113,7 @@ interface BaiBaoApi {
   detect(d: string): Promise<IpcResult<EngineInfo>>;
   startTranslate(o: Record<string, unknown>): Promise<IpcResult<{ started: true }>>;
   /** 一键汉化：装桥 → 启动游戏 → 边玩边翻（关闭游戏即自动还原） */
+  adoptPath(p: string): Promise<IpcResult<string>>;
   runtimeStart(gameDir: string): Promise<IpcResult<unknown>>;
   /** 收尾：结束游戏 + 逐字节还原游戏文件 */
   runtimeStop(): Promise<IpcResult<unknown>>;
@@ -168,6 +169,10 @@ const css = `
   body { margin:0; font-family:"PingFang SC","Microsoft YaHei",system-ui,sans-serif;
          background:#0f1115; color:#e7ebf0; -webkit-font-smoothing:antialiased; }
   .wrap { max-width:1080px; margin:0 auto; padding:34px 26px 90px; }
+  /* 拖拽时的视觉反馈：不提示的话用户根本不知道"能不能往里拖" */
+  .wrap.dragging { outline: 2px dashed #4a7ede; outline-offset: -10px; border-radius: 14px; }
+  .wrap.dragging .sub { color: #9fc0ff; }
+
   .kicker { font-size:11px; letter-spacing:.18em; color:#6b7686; font-weight:700; text-transform:uppercase; }
   h1 { font-size:26px; margin:8px 0 4px; letter-spacing:-.01em; }
   .sub { color:#98a2b0; font-size:13.5px; margin-bottom:26px; }
@@ -253,6 +258,8 @@ export default function App(): React.ReactElement {
   const [rtInfo, setRtInfo] = React.useState<{
     requested?: number; localHits?: number; apiGot?: number; storeSize?: number; providerName?: string;
   } | null>(null);
+  /** 是否正把东西拖在窗口上（给个视觉反馈，否则用户不知道"能不能拖"） */
+  const [dragging, setDragging] = React.useState(false);
   const [outcome, setOutcome] = React.useState<Outcome | null>(null);
   const [restored, setRestored] = React.useState<RestoreOutcome | null>(null);
   const [error, setError] = React.useState('');
@@ -306,20 +313,14 @@ export default function App(): React.ReactElement {
     };
   }, [api]);
 
-  /** 选目录 → 立刻识别引擎（"选错目录"要马上告诉用户，而不是等点了开始才报错） */
-  const chooseDir = async (): Promise<void> => {
+  /** 定下游戏目录后统一走这一步：立刻识别引擎（"选错目录"要马上告诉用户，而不是等点了开始才报错） */
+  const adoptDir = async (dir: string): Promise<void> => {
     setError('');
     setOutcome(null);
     setRestored(null);
-    const r = await api.pickGameDir();
-    if (!r.ok) {
-      setError(r.error ?? '选择目录失败');
-      return;
-    }
-    if (!r.data) return; // 用户取消
-    setGameDir(r.data);
+    setGameDir(dir);
     setDetecting(true);
-    const d = await api.detect(r.data);
+    const d = await api.detect(dir);
     setDetecting(false);
     if (!d.ok || !d.data) {
       setEngine(null);
@@ -327,6 +328,42 @@ export default function App(): React.ReactElement {
       return;
     }
     setEngine(d.data);
+  };
+
+  /** 选目录（按钮） */
+  const chooseDir = async (): Promise<void> => {
+    const r = await api.pickGameDir();
+    if (!r.ok) {
+      setError(r.error ?? '选择目录失败');
+      return;
+    }
+    if (!r.data) return; // 用户取消
+    await adoptDir(r.data);
+  };
+
+  /**
+   * 拖进来就认（拖 `Game.exe` 或拖游戏文件夹都行）。
+   *
+   * 路径折算放主进程做：渲染层拿不到可靠的文件类型（`File` 对象对目录和文件长得一样）。
+   */
+  const onDrop = async (e: React.DragEvent): Promise<void> => {
+    e.preventDefault();
+    setDragging(false);
+    // 不是拖文件就别管（在窗口里拖选一段文字也会触发 drop —— 那时不该弹错）
+    const files = e.dataTransfer?.files;
+    if (!files || files.length === 0) return;
+    const f = files[0] as File & { path?: string };
+    const p = f.path;
+    if (!p) {
+      setError('读不到拖进来的路径 —— 请改用「选择目录…」按钮');
+      return;
+    }
+    const r = await api.adoptPath(p);
+    if (!r.ok || !r.data) {
+      setError(r.error ?? '这个路径用不了');
+      return;
+    }
+    await adoptDir(r.data);
   };
 
   const start = async (): Promise<void> => {
@@ -459,10 +496,18 @@ export default function App(): React.ReactElement {
   return (
     <>
       <style>{css}</style>
-      <div className="wrap">
+      <div
+        className={`wrap${dragging ? ' dragging' : ''}`}
+        onDragOver={(e) => {
+          e.preventDefault();
+          if (!dragging) setDragging(true);
+        }}
+        onDragLeave={() => setDragging(false)}
+        onDrop={(e) => void onDrop(e)}
+      >
         <div className="kicker">Baibao Box · 主线闭环</div>
         <h1>白的百宝箱</h1>
-        <div className="sub">拖进来，点一下，能读了。</div>
+        <div className="sub">{dragging ? '松手就行 —— 拖 Game.exe 或游戏文件夹都可以' : '拖进来，点一下，能读了。'}</div>
 
         <div className="tabs">
           <button className={`tab${tab === 'translate' ? ' active' : ''}`} onClick={() => setTab('translate')}>

@@ -1,5 +1,5 @@
 import { BrowserWindow, dialog, ipcMain, shell } from 'electron';
-import { existsSync } from 'node:fs';
+import { existsSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { registerBuiltinPlugins } from './bootstrap-plugins';
 import { registry } from '@platform/plugin-registry';
@@ -62,6 +62,7 @@ export const IPC = {
   logs: 'bb:logs',
   logsClear: 'bb:logs-clear',
   // ── 一键汉化（运行时）──
+  adoptPath: 'bb:adopt-path',
   runtimeStart: 'bb:runtime-start',
   runtimeStop: 'bb:runtime-stop',
   runtimeStatus: 'bb:runtime-status',
@@ -360,6 +361,22 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
   });
 
   // ── 在资源管理器里打开（备份目录、文本库所在目录）──
+  /**
+   * 把"拖进来的路径"折算成**游戏目录**。
+   *
+   * 用户可能拖 `Game.exe`（要的是它所在目录），也可能直接拖游戏文件夹 —— 两种都得认。
+   * 判断必须在主进程做：渲染层拿不到可靠的文件类型信息（`File` 对象对目录和文件长得一样）。
+   */
+  ipcMain.handle(IPC.adoptPath, async (_e, p: unknown): Promise<IpcResult<string>> => {
+    if (typeof p !== 'string' || p.length === 0) return { ok: false, error: '路径为空' };
+    try {
+      const st = statSync(p);
+      return { ok: true, data: st.isDirectory() ? p : dirname(p) };
+    } catch (e) {
+      return { ok: false, error: `读不到这个路径：${(e as Error).message}` };
+    }
+  });
+
   // ── 一键汉化（运行时）────────────────────────────────────────────
   //
   // 与"静态汉化"（IPC.translate）的分工：

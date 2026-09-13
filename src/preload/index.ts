@@ -33,6 +33,7 @@ const CH = {
   wbImport: 'bb:wb-import',
   wbPickExport: 'bb:wb-pick-export',
   wbPickImport: 'bb:wb-pick-import',
+  adoptPath: 'bb:adopt-path',
   runtimeStart: 'bb:runtime-start',
   runtimeStop: 'bb:runtime-stop',
   runtimeStatus: 'bb:runtime-status',
@@ -104,6 +105,8 @@ const api = {
 
   /** 在资源管理器里定位文件/目录 */
   reveal: (path: string): Promise<IpcResult<true>> => ipcRenderer.invoke(CH.reveal, path),
+  /** 把拖进来的路径折算成游戏目录（拖 Game.exe 或拖文件夹都认） */
+  adoptPath: (p: string): Promise<IpcResult<string>> => ipcRenderer.invoke(CH.adoptPath, p),
 
   /**
    * **一键汉化**：把运行时桥装进游戏、启动它，宿主边玩边翻。
