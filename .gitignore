@@ -1,0 +1,32 @@
+node_modules/
+out/
+dist/
+release/
+.tmp-cli/
+# 原生侧构建产物（libs/minhook 是 vendored 依赖，要入库）
+native/build/
+*.obj
+*.pdb
+*.ilk
+*.exp
+# 验收脚本的运行产物（每次跑都会重新生成，不入库）
+native/_acceptance_*_out.txt
+native/_acceptance_out.txt
+native/_wdtest_*.out
+native/build*/**/_wdtest_*.out
+# 玩具目标在运行时写出的自述 / 看门狗自测报告
+*.selfreport.txt
+*.wdtest.txt
+# largeAddressAware 改 exe 前的备份（验收脚本会自己清理，防漏）
+native/build/**/*.exe.bak
+# MV 运行时探针/验收的产物（每次跑都会重新生成）
+bb_probe_result.json
+bb_layout_accept.json
+bb_runtime_result.json
+# electron-vite 编译 ts 配置时留下的临时文件
+electron.vite.config.*.mjs
+*.log
+.DS_Store
+coverage/
+.vite/
+.cache/

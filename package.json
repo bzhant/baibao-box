@@ -1,0 +1,71 @@
+{
+  "name": "baibao-box",
+  "productName": "白的百宝箱",
+  "version": "0.1.0",
+  "description": "面向日/英 galgame 与 RPG 游戏的桌面工具箱：一键汉化 + 悬浮翻译 + 存档 + 修改器 + 百宝箱工具集",
+  "author": "Bai",
+  "license": "MIT",
+  "private": true,
+  "main": "./out/main/index.js",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "start": "electron-vite preview",
+    "test": "vitest run",
+    "pretest": "node scripts/ensure-node-abi.mjs",
+    "test:watch": "vitest",
+    "e2e": "playwright test",
+    "smoke": "electron . --smoke-test --disable-gpu",
+    "translate": "electron . --disable-gpu",
+    "lint": "eslint . --ext .ts,.tsx",
+    "typecheck": "tsc --noEmit",
+    "rebuild:node": "npm rebuild better-sqlite3",
+    "rebuild:electron": "electron-builder install-app-deps",
+    "postinstall": "electron-builder install-app-deps",
+    "dist": "npm run build && electron-builder",
+    "dist:dir": "npm run build && electron-builder --dir"
+  },
+  "dependencies": {
+    "@types/iconv-lite": "^0.0.1",
+    "@types/ws": "^8.18.1",
+    "better-sqlite3": "^11.3.0",
+    "electron-store": "^8.2.0",
+    "electron-updater": "^6.3.0",
+    "iconv-lite": "^0.7.3",
+    "ws": "^8.21.3",
+    "zustand": "^4.5.5"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^20.14.0",
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "electron": "^30.0.0",
+    "electron-builder": "^24.13.3",
+    "electron-vite": "^2.3.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "typescript": "^5.5.4",
+    "vite": "^5.4.0",
+    "vitest": "^2.0.5"
+  },
+  "build": {
+    "appId": "com.baibao.box",
+    "productName": "白的百宝箱",
+    "files": [
+      "out/**",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  }
+}
