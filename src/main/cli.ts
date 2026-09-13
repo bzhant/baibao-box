@@ -7,9 +7,17 @@ import {
   restoreGame,
   runTranslate,
   dbPath,
+  pickProvider,
   type TranslateOutcome,
 } from './translate-service';
 import type { PipelineProgress } from '../pipeline/translate-pipeline';
+import {
+  cleanupGameDir,
+  lastRuntimeSummary,
+  startRuntime,
+  stopRuntime,
+  whenRuntimeStopped,
+} from './runtime-service';
 
 /**
  * 命令行入口（headless）：`npm run translate -- --game <游戏目录> [选项]`
@@ -49,6 +57,10 @@ interface CliArgs {
   provider?: string;
   /** 只回写：不抽取、不翻译，把库里已译/已复核的译文落到游戏文件 */
   repackOnly: boolean;
+  /** 运行时汉化：装桥 → 起游戏 → 边玩边翻 → 退出自动还原（MV/MZ） */
+  runtime?: string;
+  /** 万一异常退出，把游戏目录收干净 */
+  runtimeRestore?: string;
   help: boolean;
 }
 
@@ -70,6 +82,8 @@ export function parseArgs(argv: readonly string[]): CliArgs {
       case '--from': args.from = next() ?? args.from; break;
       case '--to': args.to = next() ?? args.to; break;
       case '--provider': args.provider = next(); break;
+      case '--runtime': args.runtime = next(); break;
+      case '--runtime-restore': args.runtimeRestore = next(); break;
       case '--help':
       case '-h': args.help = true; break;
       default: break;
@@ -95,10 +109,15 @@ const HELP = `
   --to <lang>       目标语言，默认 zh-CN
   --provider <id>   openai | stub（默认：有 BAIBAO_OPENAI_API_KEY 用 openai，否则 stub）
 
+运行时汉化（一键，MV/MZ）：
+  --runtime <目录>         装桥 → 启动游戏 → 边玩边翻 → **关闭游戏即自动还原**
+  --runtime-restore <目录> 万一异常退出（强杀/断电），把游戏目录收干净
+
 示例：
   npm run translate -- --game "E:\\games\\某游戏" --limit 30
   npm run translate -- --game "E:\\games\\某游戏" --font
   npm run translate -- --game "E:\\games\\某游戏" --restore
+  npm run translate -- --runtime "E:\\games\\某游戏"
 `;
 
 /** 把一次汉化的结果排版到 stdout */
@@ -133,14 +152,66 @@ function printReport(o: TranslateOutcome): void {
 
 export async function runCli(argv: readonly string[]): Promise<number> {
   const args = parseArgs(argv);
-  if (args.help || !args.game) {
+  if (args.help) {
     console.log(HELP);
-    return args.help ? 0 : 2;
+    return 0;
   }
 
   registerBuiltinPlugins(); // 幂等
 
   try {
+    // ── 运行时汉化（一键）──
+    //
+    // 与静态改文件的分工见 runtime-service.ts：这条**不改游戏数据文件**，
+    // 退出时逐字节还原；翻译走界面里配的那套 API（Provider）。
+    if (args.runtimeRestore) {
+      const r = cleanupGameDir(args.runtimeRestore);
+      console.log(`已收尾游戏目录：${args.runtimeRestore}\n  ${r.how}`);
+      return 0;
+    }
+    if (args.runtime) {
+      // Provider 在**这里**解析（命令行与界面各自解析，服务只负责编排）
+      const { provider, autoStub } = pickProvider(args.provider);
+      const r = await startRuntime({
+        gameDir: args.runtime,
+        provider,
+        providerName: provider.displayName,
+        autoStub,
+      });
+      console.log('\n──── 运行时汉化（一键）────────────────');
+      console.log(`  引擎            ${r.engine}（运行时桥）`);
+      console.log(`  翻译接口        ${r.providerName}${r.autoStub ? '  ⚠ 没配密钥，降级为本地假机翻' : ''}`);
+      console.log(`  游戏            ${r.gameDir}`);
+      console.log(`  译文库          ${r.storeSize} 条（本次从游戏目录导入 ${r.seeded} 条）`);
+      console.log(`  桥日志          ${r.bridgeLog}`);
+      console.log('\n  ✓ 游戏已启动，边玩边翻。**关闭游戏**即自动还原游戏文件；也可以按 Ctrl+C。\n');
+
+      const onSignal = (): void => {
+        void stopRuntime().then(() => process.exit(130));
+      };
+      process.once('SIGINT', onSignal);
+      process.once('SIGTERM', onSignal);
+
+      await whenRuntimeStopped();
+
+      const s = lastRuntimeSummary();
+      console.log('\n──── 收尾 ────────────────────────────');
+      if (s) {
+        console.log(`  取词请求        ${s.requested ?? 0} 条（分 ${s.batches ?? 0} 批）`);
+        console.log(`  命中本地译文库  ${s.localHits ?? 0} 条`);
+        console.log(`  调用翻译接口    ${s.apiCalls ?? 0} 次 / 送出 ${s.apiSent ?? 0} 条 / 得译文 ${s.apiGot ?? 0} 条`);
+        console.log(`  译文库          ${s.storeSize ?? 0} 条（下次启动直接命中）`);
+      }
+      console.log('  ✓ 游戏文件已还原（逐字节 + 哈希校验）');
+      return 0;
+    }
+
+    // ── 静态流程：必须有 --game ──
+    if (!args.game) {
+      console.log(HELP);
+      return 2;
+    }
+
     // ── 还原模式 ──
     if (args.restore) {
       console.log(`还原补丁：${args.game}`);

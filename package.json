@@ -1,7 +1,7 @@
 {
   "name": "baibao-box",
   "productName": "白的百宝箱",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "面向日/英 galgame 与 RPG 游戏的桌面工具箱：一键汉化 + 悬浮翻译 + 存档 + 修改器 + 百宝箱工具集",
   "author": "Bai",
   "license": "MIT",
@@ -66,6 +66,12 @@
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true
-    }
+    },
+    "extraResources": [
+      {
+        "from": "tools/mv-runtime/BB_RuntimeBridge.js",
+        "to": "bb-runtime/BB_RuntimeBridge.js"
+      }
+    ]
   }
 }

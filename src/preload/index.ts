@@ -33,6 +33,9 @@ const CH = {
   wbImport: 'bb:wb-import',
   wbPickExport: 'bb:wb-pick-export',
   wbPickImport: 'bb:wb-pick-import',
+  runtimeStart: 'bb:runtime-start',
+  runtimeStop: 'bb:runtime-stop',
+  runtimeStatus: 'bb:runtime-status',
   wbRepackPreview: 'bb:wb-repack-preview',
   wbRepack: 'bb:wb-repack',
   progress: 'bb:progress',
@@ -101,6 +104,17 @@ const api = {
 
   /** 在资源管理器里定位文件/目录 */
   reveal: (path: string): Promise<IpcResult<true>> => ipcRenderer.invoke(CH.reveal, path),
+
+  /**
+   * **一键汉化**：把运行时桥装进游戏、启动它，宿主边玩边翻。
+   * 返回时游戏已经在跑；关闭游戏即自动还原游戏文件。
+   */
+  runtimeStart: (gameDir: string): Promise<IpcResult<unknown>> =>
+    ipcRenderer.invoke(CH.runtimeStart, gameDir),
+  /** 收尾：结束游戏并逐字节还原游戏文件 */
+  runtimeStop: (): Promise<IpcResult<unknown>> => ipcRenderer.invoke(CH.runtimeStop),
+  /** 当前运行时会话状态（界面轮询它显示进度） */
+  runtimeStatus: (): Promise<IpcResult<unknown>> => ipcRenderer.invoke(CH.runtimeStatus),
 
   /** 环境信息 */
   env: (): Promise<IpcResult<{ dbPath: string; hasApiKey: boolean; translating: boolean }>> =>

@@ -14,6 +14,13 @@ import {
 } from './translate-service';
 import type { PipelineProgress } from '../pipeline/translate-pipeline';
 import {
+  lastRuntimeSummary,
+  runtimeStatus,
+  startRuntime,
+  stopRuntime,
+} from './runtime-service';
+import { pickProvider } from './translate-service';
+import {
   previewRepack,
   repackGame,
 } from './translate-service';
@@ -54,6 +61,10 @@ export const IPC = {
   cfgSetKey: 'bb:cfg-set-key',
   logs: 'bb:logs',
   logsClear: 'bb:logs-clear',
+  // ── 一键汉化（运行时）──
+  runtimeStart: 'bb:runtime-start',
+  runtimeStop: 'bb:runtime-stop',
+  runtimeStatus: 'bb:runtime-status',
   // ── 人工修订工作台（工作台能力）──
   wbList: 'bb:wb-list',
   wbSave: 'bb:wb-save',
@@ -349,6 +360,45 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
   });
 
   // ── 在资源管理器里打开（备份目录、文本库所在目录）──
+  // ── 一键汉化（运行时）────────────────────────────────────────────
+  //
+  // 与"静态汉化"（IPC.translate）的分工：
+  //   静态 —— 抽取 → 翻译 → 回写游戏数据文件；持久、离线可玩，但改游戏文件。
+  //   运行时 —— 启动游戏时把桥装进去，边玩边翻；**不改游戏数据文件**，
+  //             对加密游戏同样有效，退出时逐字节还原。
+  // 翻译都走同一套 Provider（界面里配的 API 密钥/模型/baseUrl）。
+  ipcMain.handle(IPC.runtimeStart, async (_e, gameDir: unknown): Promise<IpcResult<unknown>> => {
+    if (typeof gameDir !== 'string' || gameDir.length === 0) {
+      return { ok: false, error: '需要游戏目录' };
+    }
+    try {
+      const { provider, autoStub } = pickProvider(undefined);
+      const r = await startRuntime({
+        gameDir,
+        provider,
+        providerName: provider.displayName,
+        autoStub,
+      });
+      logInfo('ipc', `一键汉化已启动：${r.engine} · ${r.providerName}`);
+      return { ok: true, data: r };
+    } catch (e) {
+      return { ok: false, error: (e as Error).message };
+    }
+  });
+
+  ipcMain.handle(IPC.runtimeStop, async (): Promise<IpcResult<unknown>> => {
+    try {
+      await stopRuntime();
+      return { ok: true, data: runtimeStatus() };
+    } catch (e) {
+      return { ok: false, error: (e as Error).message };
+    }
+  });
+
+  ipcMain.handle(IPC.runtimeStatus, async (): Promise<IpcResult<unknown>> => {
+    return { ok: true, data: { ...runtimeStatus(), last: lastRuntimeSummary() } };
+  });
+
   ipcMain.handle(IPC.reveal, async (_e, p: unknown): Promise<IpcResult<true>> => {
     try {
       if (typeof p !== 'string' || !p.trim()) return err('路径为空');

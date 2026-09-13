@@ -48,14 +48,12 @@ export interface RuntimeSessionOptions {
 }
 
 export interface RuntimeStats {
-  /** 原生侧发起了几次取词请求 */
+  /** 引擎侧发起了几次取词请求 */
   batches: number;
   /** 一共要了多少条 */
   requested: number;
   /** 其中有译文的条数 */
   translated: number;
-  /** 原生侧自报的运行时统计（run / req / got / none / apply） */
-  native: Record<string, number> | null;
 }
 
 interface TranslateArgs {
@@ -140,8 +138,14 @@ export class RuntimeSession {
     return this.connected?.no ?? 0;
   }
 
-  async stats(): Promise<RuntimeStats> {
-    return { ...this.counters, native: await this.nativeStats() };
+  /**
+   * 宿主侧账本（只读本地计数，**不触碰对端**，随时可查）。
+   *
+   * 引擎侧的统计要靠 `nativeStats()` 反向 RPC 去问 —— 那要求它还在线，
+   * 所以两件事分开：这里永远是"我这边记的账"，不会因为对端退出而失败。
+   */
+  stats(): RuntimeStats {
+    return { ...this.counters };
   }
 
   async close(): Promise<void> {

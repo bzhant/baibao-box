@@ -80,7 +80,7 @@ describe.skipIf(!canRun)('运行时注入：宿主驱动 → 取词 → 翻译 �
         nativeDir: NATIVE_DIR,
         translator,
       });
-      expect(handle.pid, '注入后应拿到目标进程号').toBeGreaterThan(0);
+      expect(handle.pid ?? 0, '注入后应拿到目标进程号').toBeGreaterThan(0);
 
       // ① 宿主确实被"要过词"，并且给出了译文
       const served = await waitFor(async () => {
@@ -91,14 +91,19 @@ describe.skipIf(!canRun)('运行时注入：宿主驱动 → 取词 → 翻译 �
 
       // ② 原生侧确实把译文收下并回填了
       //    （这条走的是"宿主 → 原生"的反向 RPC，顺带把那个方向也验了）
+      //    用持有对象而不是裸变量：赋值发生在 async 回调里，
+      //    TS 的控制流分析在读取处仍按初始值收窄，会误报 "Property 'run' does not exist on type 'never'"。
+      const seen: { stat: Record<string, number> | null } = { stat: null };
       const nativeApplied = await waitFor(async () => {
-        const s = await handle!.session.stats();
-        return (s.native?.got ?? 0) > 0 && (s.native?.apply ?? 0) > 0;
+        const s = await handle!.session.nativeStats();
+        if (s && (s.got ?? 0) > 0 && (s.apply ?? 0) > 0) {
+          seen.stat = s;
+          return true;
+        }
+        return false;
       }, 15_000);
       expect(nativeApplied, '原生侧没有收到译文，或收到了却没回填').toBe(true);
-
-      const stats = await handle.session.stats();
-      expect(stats.native?.run, '运行时取词应处于启用状态').toBe(1);
+      expect(seen.stat?.run, '运行时取词应处于启用状态').toBe(1);
 
       // ── 收尾并读日志 ──
       await handle.session.close();

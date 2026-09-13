@@ -112,6 +112,12 @@ interface BaiBaoApi {
   pickGameDir(): Promise<IpcResult<string | null>>;
   detect(d: string): Promise<IpcResult<EngineInfo>>;
   startTranslate(o: Record<string, unknown>): Promise<IpcResult<{ started: true }>>;
+  /** 一键汉化：装桥 → 启动游戏 → 边玩边翻（关闭游戏即自动还原） */
+  runtimeStart(gameDir: string): Promise<IpcResult<unknown>>;
+  /** 收尾：结束游戏 + 逐字节还原游戏文件 */
+  runtimeStop(): Promise<IpcResult<unknown>>;
+  /** 运行时会话状态（界面轮询显示进度） */
+  runtimeStatus(): Promise<IpcResult<unknown>>;
   restore(d: string): Promise<IpcResult<RestoreOutcome>>;
   reveal(p: string): Promise<IpcResult<true>>;
   env(): Promise<IpcResult<{ dbPath: string; hasApiKey: boolean; translating: boolean }>>;
@@ -241,6 +247,12 @@ export default function App(): React.ReactElement {
 
   const [running, setRunning] = React.useState(false);
   const [progress, setProgress] = React.useState<ProgressEvent | null>(null);
+  // ── 一键汉化（运行时）──
+  const [rtRunning, setRtRunning] = React.useState(false);
+  const [rtMsg, setRtMsg] = React.useState<string | null>(null);
+  const [rtInfo, setRtInfo] = React.useState<{
+    requested?: number; localHits?: number; apiGot?: number; storeSize?: number; providerName?: string;
+  } | null>(null);
   const [outcome, setOutcome] = React.useState<Outcome | null>(null);
   const [restored, setRestored] = React.useState<RestoreOutcome | null>(null);
   const [error, setError] = React.useState('');
@@ -390,6 +402,55 @@ export default function App(): React.ReactElement {
         { id: 'zh-CN', label: '简体中文 zh-CN' },
       ];
 
+  /** 一键汉化：装桥 → 启动游戏 → 边玩边翻。关闭游戏即自动还原（改动可逆）。 */
+  const doRuntimeStart = async (): Promise<void> => {
+    if (!gameDir) return;
+    setRtRunning(true);
+    setRtInfo(null);
+    setRtMsg('正在装入运行时桥并启动游戏…（首次启动可能要等游戏加载完）');
+    const r = await api.runtimeStart(gameDir);
+    if (!r.ok) {
+      setRtRunning(false);
+      setRtMsg(`启动失败：${r.error}`);
+      return;
+    }
+    const d = r.data as { engine?: string; providerName?: string };
+    setRtMsg(`已接管：${d.engine} · ${d.providerName}。游戏里已经在翻；**关闭游戏**即自动还原游戏文件。`);
+  };
+
+  const doRuntimeStop = async (): Promise<void> => {
+    setRtMsg('正在收尾（结束游戏 + 还原游戏文件）…');
+    const r = await api.runtimeStop();
+    setRtRunning(false);
+    setRtMsg(r.ok ? '已收尾：游戏文件已逐字节还原。' : `收尾失败：${r.error}`);
+  };
+
+  // 运行中轮询状态（显示"取了词多少条 / 命中本地多少条"），游戏一关就自动结束
+  React.useEffect(() => {
+    if (!rtRunning) return;
+    let stop = false;
+    const tick = async (): Promise<void> => {
+      const r = await api.runtimeStatus();
+      if (stop || !r.ok) return;
+      const d = r.data as {
+        running?: boolean; requested?: number; localHits?: number; apiGot?: number;
+        storeSize?: number; providerName?: string;
+      };
+      if (!d.running) {
+        setRtRunning(false);
+        setRtMsg('游戏已关闭 —— 游戏文件已自动还原。');
+        return;
+      }
+      setRtInfo(d);
+    };
+    void tick();
+    const h = window.setInterval(() => void tick(), 2000);
+    return () => {
+      stop = true;
+      window.clearInterval(h);
+    };
+  }, [rtRunning]);
+
   const busy = running || detecting;
   const effectiveProvider = providerId === 'auto'
     ? (env?.hasApiKey ? 'openai（检测到 API Key）' : 'stub 本地假机翻（未检测到 API Key）')
@@ -476,9 +537,9 @@ export default function App(): React.ReactElement {
               )}
               {engine.encrypted && (
                 <div className="warnbox">
-                  这个游戏的数据文件被加密了，**静态改文件**这条路走不通。
-                  需要"运行时提取"能力才能处理（计划中的运行时提取），当前会被拒绝执行 ——
-                  与其改坏文件，不如先说清楚。
+                  这个游戏的数据文件被加密了，<b>静态改文件</b>这条路走不通。
+                  请用下面的「<b>一键汉化并启动</b>」（运行时汉化）：它在游戏运行时取词，
+                  不依赖读取被加密的数据文件。
                 </div>
               )}
             </div>
@@ -554,6 +615,35 @@ export default function App(): React.ReactElement {
               <b>不是真翻译</b>。要看真实效果，请配置密钥后重启。
             </div>
           )}
+        </div>
+
+        {/* ── 2.5 一键汉化（运行时）── */}
+        <div className="card">
+          <h3><span className="step">★</span>一键汉化并启动（运行时 · 推荐）</h3>
+          <div className="note">
+            启动游戏时把"运行时桥"装进去，<b>边玩边翻</b>：<b>不改游戏数据文件</b>，
+            数据被加密的游戏同样有效，<b>关闭游戏即自动逐字节还原</b>。
+            译文走上面配置的接口，并本地积累成译文库（第二次启动瞬时且不再花钱）。
+            目前支持 RPG Maker MV / MZ。
+          </div>
+          <div className="row" style={{ marginTop: 14, gap: 10, display: 'flex', alignItems: 'center' }}>
+            <button className="primary" disabled={!gameDir || rtRunning} onClick={() => void doRuntimeStart()}>
+              {rtRunning ? '汉化运行中…' : '一键汉化并启动'}
+            </button>
+            <button className="ghost" disabled={!rtRunning} onClick={() => void doRuntimeStop()}>
+              结束并还原
+            </button>
+            {rtRunning && rtInfo && (
+              <span className="row" style={{ gap: 8 }}>
+                <span className="chip on">运行中</span>
+                <span className="chip">取词 {rtInfo.requested ?? 0}</span>
+                <span className="chip">本地命中 {rtInfo.localHits ?? 0}</span>
+                <span className="chip">接口得译文 {rtInfo.apiGot ?? 0}</span>
+                <span className="chip mono">译文库 {rtInfo.storeSize ?? 0}</span>
+              </span>
+            )}
+          </div>
+          {rtMsg && <div className="note" style={{ marginTop: 10 }}>{rtMsg}</div>}
         </div>
 
         {/* ── 3. 进度 / 结果 ── */}
