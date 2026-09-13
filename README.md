@@ -8,7 +8,7 @@
 [![平台](https://img.shields.io/badge/平台-Windows%2010%2F11-0078d4.svg)](#环境要求)
 [![Electron](https://img.shields.io/badge/Electron-30-47848f.svg)](https://www.electronjs.org/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.5-3178c6.svg)](https://www.typescriptlang.org/)
-[![版本](https://img.shields.io/badge/版本-0.1.0-orange.svg)](#项目状态)
+[![版本](https://img.shields.io/badge/版本-0.2.0-orange.svg)](#项目状态)
 
 一个 Windows 桌面工具，把「**找个外文游戏想玩 → 看不懂 → 装一堆工具来回折腾**」
 压缩成「**选目录 → 选语言 → 开始**」。
@@ -250,8 +250,12 @@ npm run dev     # 开发模式起窗
 
 ## 项目状态
 
-**v0.1.0** —— 进行中。当前可用形态：对一个真实 MV / MZ / Ren'Py 游戏完成
-「导入 → 汉化 → 修订 → 回写 → 还原」全流程。
+**v0.2.0** —— 进行中。两种可用形态：
+
+- **一键汉化（运行时）**（MV / MZ）：选游戏 → 点一下 → 游戏已经是中文。
+  **不改游戏数据文件**，被加密的数据也照样有效（运行时本来就不读它），关闭游戏自动逐字节还原。
+- **静态汉化**（MV / MZ / Ren'Py）：译文**落进游戏数据文件** —— 之后离线可玩、不依赖本程序运行。
+  适合"改一次永久生效"，配合工作台人工修订与「一键还原」。
 
 ### 已完成
 
