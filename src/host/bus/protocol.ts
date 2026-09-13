@@ -7,6 +7,17 @@
  * 请求信封：{"id":int,"type":int,"target":int,"cmd":"<name>","args":any}
  * 应答信封：{"id":int,"ret":any,"error":bool,"type":int}
  *
+ * **线格式（由连接方在握手时声明，两种）**：
+ *   - 连 `/`（默认）= **对象图序列化**（见 graph.ts）：能过 Error.stack / Map /
+ *     循环引用 / 共享引用。JS 侧（宿主、渲染层、测试客户端）用这个。
+ *   - 连 `/plain`   = **简易 JSON**：裸 JSON，错误降级成 `{"name","message","stack"}`。
+ *     给**没有对象图能力的对端**用（目前是 C++ 原生侧）。
+ *
+ *   两种格式的**信封结构完全一样**，只有 args/ret 的编码方式不同。
+ *   为什么允许第二种：这条链路上搬的只有字符串/数字/对象/数组，用不上引用表；
+ *   要求 C++ 把对象图实现再写一遍，是双份维护且极易两侧不一致。
+ *   代价是这条连接拿不到结构化 Error 的完整信息 —— 换的就是这点。
+ *
  * 握手（这个"舞步"是固定语义，按规格实现）：
  *   Server → Client : {"id":3,"type":0,"target":0,"cmd":"whoareyou","args":null}
  *   Client → Server : {"id":3,"type":0,"target":0,"cmd":"whoareyou","args":{<身份>}}

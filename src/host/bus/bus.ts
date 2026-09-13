@@ -1,7 +1,8 @@
 import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
 import { WebSocketServer, WebSocket } from 'ws';
-import { encodeGraph, decodeGraph, type Graph } from './graph';
+import { encodeGraph, decodeGraph, encodePlain, isGraphWire, type Graph, type WireFormat } from './graph';
+import { logInfo } from '@platform/logbus';
 import {
   DEFAULT_PORT,
   HANDSHAKE_ID,
@@ -52,6 +53,8 @@ interface Conn {
   identity: ClientIdentity;
   nextId: number;
   pending: Map<number, Pending>;
+  /** 该连接用哪种线格式（握手时由对端声明，见 graph.ts 的 WireFormat） */
+  wire: WireFormat;
 }
 
 export interface BusServerOptions {
@@ -101,7 +104,7 @@ export class BusServer {
         const wss = await this.tryListen(p);
         this.wss = wss;
         this.serverUri = `ws://127.0.0.1:${p}`;
-        wss.on('connection', (ws) => this.onConnection(ws));
+        wss.on('connection', (ws, req) => this.onConnection(ws, req.url ?? '/'));
         await this.writeStateFiles(p);
         return { port: p, uri: this.serverUri };
       } catch (err) {
@@ -140,15 +143,22 @@ export class BusServer {
     await fs.writeFile(join(this.opts.stateDir, 'listenPort'), String(port), 'utf8');
   }
 
-  private onConnection(ws: WebSocket): void {
+  private onConnection(ws: WebSocket, url: string): void {
+    // 对端在握手时声明线格式：连 `/plain` = 简易 JSON（C++ 原生侧）。
+    // 必须在**发出第一条消息之前**就确定 —— 那条 whoareyou 就得按这个格式发。
+    const wire: WireFormat = url.includes('plain') ? 'plain' : 'graph';
     const conn: Conn = {
       no: this.nextClientNo++,
       ws,
       identity: {},
       nextId: 1,
       pending: new Map(),
+      wire,
     };
     this.conns.set(ws, conn);
+    // 线格式不一致是这套架构里最难查的一类故障（表现为"发出去没反应"），
+    // 所以不静默选择：连上就把用的是哪种写进日志。
+    logInfo('bus', `client#${conn.no} 接入，线格式=${wire}`);
 
     ws.on('message', (data) => void this.onMessage(conn, data.toString()));
     ws.on('close', () => {
@@ -172,13 +182,26 @@ export class BusServer {
   }
 
   private send(conn: Conn, msg: unknown): void {
-    if (conn.ws.readyState === WebSocket.OPEN) conn.ws.send(JSON.stringify(encodeGraph(msg)));
+    if (conn.ws.readyState !== WebSocket.OPEN) return;
+    const payload =
+      conn.wire === 'plain' ? JSON.stringify(encodePlain(msg)) : JSON.stringify(encodeGraph(msg));
+    conn.ws.send(payload);
   }
 
   private async onMessage(conn: Conn, text: string): Promise<void> {
     let msg: unknown;
     try {
-      msg = decodeGraph(JSON.parse(text) as Graph);
+      const parsed: unknown = JSON.parse(text);
+      if (isGraphWire(parsed)) {
+        msg = decodeGraph(parsed as Graph);
+      } else if (conn.wire === 'plain') {
+        // 简易格式：本来就是裸 JSON，直接用
+        msg = parsed;
+      } else {
+        // 声明用对象图、却发来裸 JSON —— 这是**协议违约**。
+        // 明确报错比"猜着解"要好：猜错的话错误会出现在很远的地方，极难定位。
+        throw new Error('本连接声明使用对象图格式，但收到的是裸 JSON');
+      }
     } catch (err) {
       conn.ws.close(1002, `报文无法解析: ${(err as Error).message}`);
       return;

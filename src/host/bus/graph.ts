@@ -27,6 +27,53 @@
 
 export const GRAPH_MARK = 'isRefsSerialized' as const;
 
+/**
+ * 线格式：对象图（默认）或**简易 JSON**。
+ *
+ * 简易格式是给"没有对象图能力的对端"用的（目前是 C++ 原生侧）。
+ * 为什么不让 C++ 也实现一遍对象图：这条链路只搬字符串/数字/布尔/数组/对象，
+ * 用不上引用表、Map、循环引用；为了它们把整套格式在 C++ 里复制一份，
+ * 是纯粹的双份维护负担，且极容易两边不一致。
+ *
+ * 代价是**丢掉了 Error 的 stack 与循环引用** —— 所以错误在简易格式里
+ * 降级成 `{name,message,stack}` 这样的普通对象（见 `encodePlain`）。
+ * 谁用哪种格式，由连接方在 WebSocket 握手时显式声明（连 `/plain`）。
+ */
+export type WireFormat = 'graph' | 'plain';
+
+/** 这段已解析的 JSON 是不是对象图格式？（自描述，靠标记字段认） */
+export function isGraphWire(parsed: unknown): boolean {
+  return (
+    typeof parsed === 'object' &&
+    parsed !== null &&
+    (parsed as Record<string, unknown>)[GRAPH_MARK] === true
+  );
+}
+
+/**
+ * 把值转成简易格式能表达的东西（就是裸 JSON 能表达的那几样）。
+ *
+ * - `Error` → `{name,message,stack}`：否则 JSON.stringify 出来是 `{}`，
+ *   对端会看到"错误但没有任何信息"，比不报错还糟；
+ * - `undefined` → `null`：JSON 对 undefined 的处理是"对象里直接丢掉、
+ *   数组里变 null"，语义含糊；显式转 null 至少是确定的；
+ * - `NaN` / `Infinity` → 字符串：JSON 会把它们变成 `null`，同样丢信息。
+ */
+export function encodePlain(v: unknown): unknown {
+  if (v === undefined || v === null) return null;
+  if (v instanceof Error) {
+    return { name: v.name, message: v.message, stack: v.stack ?? '' };
+  }
+  if (Array.isArray(v)) return v.map(encodePlain);
+  if (typeof v === 'number') return Number.isFinite(v) ? v : String(v);
+  if (typeof v === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, val] of Object.entries(v as Record<string, unknown>)) out[k] = encodePlain(val);
+    return out;
+  }
+  return v;
+}
+
 export type Encoded =
   | { k: 's'; v: string }
   | { k: 'n'; v: number | 'NaN' | 'Infinity' | '-Infinity' | '-0' }

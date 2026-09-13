@@ -87,14 +87,30 @@ public:
         return sendAll(frame.data(), frame.size());
     }
 
-    /** 收一个文本帧（阻塞）。返回 false 表示连接断了。 */
-    bool recvText(std::string& out, int timeoutMs = 30000) {
+    /**
+     * 收一个文本帧（阻塞，带超时）。
+     *
+     * @param timedOut 非空时用于区分两种"收不到"：
+     *                 · `true`  = **空闲超时** —— 连接好着呢，只是这段时间没消息；
+     *                 · `false` = 真断连 / 帧错位。
+     *
+     * ★ 这个区分是必需的：长连接大部分时间是**空闲**的，把空闲当成断线，
+     *   通信线程会自己把自己拆掉（实测：5 秒静默后自杀，然后"运行时取词"
+     *   就再也不工作了，而日志看起来像"网络断了"）。
+     */
+    bool recvText(std::string& out, int timeoutMs = 30000, bool* timedOut = nullptr) {
+        if (timedOut) *timedOut = false;
         if (!isOpen()) return false;
         out.clear();
 
         for (;;) {
             unsigned char hdr[2];
-            if (!recvAll(reinterpret_cast<char*>(hdr), 2, timeoutMs)) return false;
+            int readNow = 0;
+            if (!recvAll(reinterpret_cast<char*>(hdr), 2, timeoutMs, &readNow)) {
+                // 帧边界上、一个字节都没读到 = 纯空闲；读到一半才断 = 帧已错位，当断连
+                if (timedOut && readNow == 0) *timedOut = true;
+                return false;
+            }
 
             const bool fin = (hdr[0] & 0x80) != 0;
             const unsigned opcode = hdr[0] & 0x0F;
@@ -174,7 +190,8 @@ private:
         return true;
     }
 
-    bool recvAll(char* data, int len, int timeoutMs) {
+    bool recvAll(char* data, int len, int timeoutMs, int* readSoFar = nullptr) {
+        if (readSoFar) *readSoFar = 0;
         // 设置接收超时，避免永久阻塞把游戏卡死
         DWORD tv = static_cast<DWORD>(timeoutMs);
         setsockopt(sock(), SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
@@ -182,9 +199,14 @@ private:
         int got = 0;
         while (got < len) {
             int n = ::recv(sock(), data + got, len - got, 0);
-            if (n <= 0) return false;
+            if (n <= 0) {
+                // 把"已经读到多少"报出去：调用方靠它区分"纯空闲"与"帧读到一半断了"
+                if (readSoFar) *readSoFar = got;
+                return false;
+            }
             got += n;
         }
+        if (readSoFar) *readSoFar = got;
         return true;
     }
 
@@ -209,8 +231,14 @@ private:
     bool handshake(const char* host, unsigned short port, const char* userAgent) {
         char req[512];
         // 固定一个 Key 即可：我们**不校验** Sec-WebSocket-Accept（只判 101）
+        //
+        // ★ 路径故意写成 `/plain`：告诉宿主"本端只会简易 JSON"。
+        //   宿主默认按**对象图序列化**收发（能过 Error.stack / 循环引用），
+        //   那是 JS 侧才需要的能力；C++ 这边只搬字符串/数字/对象/数组，
+        //   按对象图去解会在顶层找不到 cmd（真正的字段藏在 root 里），
+        //   表现成"发过去没反应"，极难排查 —— 所以在握手时就讲清楚。
         std::snprintf(req, sizeof(req),
-            "GET / HTTP/1.1\r\n"
+            "GET /plain HTTP/1.1\r\n"
             "Host: %s:%u\r\n"
             "Upgrade: websocket\r\n"
             "Connection: Upgrade\r\n"
