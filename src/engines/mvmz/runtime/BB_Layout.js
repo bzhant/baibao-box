@@ -4,7 +4,7 @@
 // 作用：给 MV 补上它**本来就没有**的横向自动折行，让换语言后变长的文本
 //       能在窗口里正常断开，而不是冲出右边界被裁掉。
 //
-// ── 为什么必须做（实测依据，见 docs/recon/MV-引擎侦察报告.md）──
+// ── 为什么必须做（实测依据）──
 //   MV 原版**没有**横向折行：
 //     · Window_Base.processNormalCharacter 只做 textState.x += w，没有宽度判断
 //     · Window_Message.needsNewPage 只判**垂直**溢出

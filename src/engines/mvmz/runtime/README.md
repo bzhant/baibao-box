@@ -9,7 +9,7 @@ RPG Maker MV 的**运行时**插件。与 `src/engines/mvmz/` 的 TS 侧分工�
 
 ## 为什么 MV 需要运行时插件
 
-先侦察再写码，侦察结论（详见 `docs/recon/MV-引擎侦察报告.md`）：
+先侦察再写码，侦察结论：
 
 - **MV 原版没有横向自动折行** —— `Window_Base.processNormalCharacter` 只做
   `textState.x += w`，没有任何宽度判断；`needsNewPage` 只判垂直；全文件无折行代码。
