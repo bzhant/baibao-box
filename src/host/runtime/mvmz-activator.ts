@@ -65,6 +65,117 @@ function registrationFragment(pluginName: string): string {
   return `\n{"name":"${pluginName}","status":true,"description":"BB runtime bridge (temporary)","parameters":{"Enabled":"true"}}\n`;
 }
 
+function skipTrivia(src: string, start: number): number {
+  let i = start;
+  for (;;) {
+    while (/\s/.test(src[i] ?? '')) i++;
+    if (src[i] === '/' && src[i + 1] === '/') {
+      i = src.indexOf('\n', i + 2);
+      if (i < 0) return src.length;
+      continue;
+    }
+    if (src[i] === '/' && src[i + 1] === '*') {
+      const end = src.indexOf('*/', i + 2);
+      return end < 0 ? src.length : skipTrivia(src, end + 2);
+    }
+    return i;
+  }
+}
+
+function findPluginsArrayStart(src: string): number {
+  let quote = '';
+  let lineComment = false;
+  let blockComment = false;
+  let escaped = false;
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i];
+    const next = src[i + 1];
+    if (lineComment) {
+      if (ch === '\n') lineComment = false;
+      continue;
+    }
+    if (blockComment) {
+      if (ch === '*' && next === '/') {
+        blockComment = false;
+        i++;
+      }
+      continue;
+    }
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === quote) quote = '';
+      continue;
+    }
+    if (ch === '/' && next === '/') {
+      lineComment = true;
+      i++;
+      continue;
+    }
+    if (ch === '/' && next === '*') {
+      blockComment = true;
+      i++;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === '`') {
+      quote = ch;
+      continue;
+    }
+    if (!src.startsWith('$plugins', i)) continue;
+    if (/[\w$]/.test(src[i - 1] ?? '') || /[\w$]/.test(src[i + 8] ?? '')) continue;
+    let cursor = skipTrivia(src, i + 8);
+    if (src[cursor] !== '=') continue;
+    cursor = skipTrivia(src, cursor + 1);
+    if (src[cursor] === '[') return cursor;
+  }
+  return -1;
+}
+
+export function findPluginsArrayEnd(src: string): number {
+  const start = findPluginsArrayStart(src);
+  if (start < 0) return -1;
+  let depth = 0;
+  let quote = '';
+  let lineComment = false;
+  let blockComment = false;
+  let escaped = false;
+  for (let i = start; i < src.length; i++) {
+    const ch = src[i];
+    const next = src[i + 1];
+    if (lineComment) {
+      if (ch === '\n') lineComment = false;
+      continue;
+    }
+    if (blockComment) {
+      if (ch === '*' && next === '/') {
+        blockComment = false;
+        i++;
+      }
+      continue;
+    }
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === quote) quote = '';
+      continue;
+    }
+    if (ch === '/' && next === '/') {
+      lineComment = true;
+      i++;
+    } else if (ch === '/' && next === '*') {
+      blockComment = true;
+      i++;
+    } else if (ch === '"' || ch === "'" || ch === '`') {
+      quote = ch;
+    } else if (ch === '[') {
+      depth++;
+    } else if (ch === ']' && --depth === 0) {
+      return i;
+    }
+  }
+  return -1;
+}
+
 /** 关掉 Chromium 的后台节流 —— 否则非前台窗口的 rAF 被节流，MV/MZ 永远不就绪（且不报错）。 */
 const CHROMIUM_FLAGS = [
   '--disable-background-timer-throttling',
@@ -99,13 +210,10 @@ export function installMvmzBridge(gameDir: string, bridgePath: string): MvmzInst
 
   // ② 拒绝覆盖同名插件（否则还原时会把游戏自己的插件删掉）
   if (existsSync(dst)) {
-    const same = sha256(readFileSync(dst)) === sha256(readFileSync(bridgePath));
-    if (!same) {
-      throw new Error(
-        `游戏目录里已存在同名插件 ${pluginName}.js 且内容不同，拒绝安装。\n` +
-          `       否则跑完会把它误删（那会破坏游戏）。位置：${dst}`,
-      );
-    }
+    throw new Error(
+      `游戏目录里已存在同名插件 ${pluginName}.js，拒绝安装。\n` +
+        `       请先确认它是否属于游戏；若是上次异常退出留下的，可先执行运行时还原。位置：${dst}`,
+    );
   }
 
   const origBytes = readFileSync(layout.pluginsJs);
@@ -118,7 +226,7 @@ export function installMvmzBridge(gameDir: string, bridgePath: string): MvmzInst
 
   // ③ 字符串追加，不重写整个文件
   const src = origBytes.toString('utf8');
-  const arrEnd = src.lastIndexOf(']');
+  const arrEnd = findPluginsArrayEnd(src);
   if (arrEnd < 0) throw new Error('plugins.js 里找不到 $plugins 数组的结尾 ]');
   const fragment = registrationFragment(pluginName);
   const entry = fragment.trimEnd();
@@ -263,6 +371,7 @@ export function createMvmzActivator(o: MvmzActivatorOptions): MvmzActivator {
         }
       } catch (e) {
         logWarn('runtime', `还原游戏文件失败：${(e as Error).message}`);
+        throw e;
       }
     },
   };

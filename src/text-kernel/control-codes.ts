@@ -35,6 +35,10 @@ export function tokenize(src: string, pattern: RegExp = DEFAULT_PATTERN): Segmen
   let last = 0;
   let m: RegExpExecArray | null;
   while ((m = re.exec(src)) !== null) {
+    if (m[0].length === 0) {
+      re.lastIndex++;
+      continue;
+    }
     if (m.index > last) segs.push({ kind: 'text', value: src.slice(last, m.index) });
     segs.push({ kind: 'token', value: m[0] });
     last = m.index + m[0].length;
@@ -104,4 +108,20 @@ export function missingPlaceholders(
     if (!translated.includes(ph(i))) missing.push(i);
   }
   return missing;
+}
+
+export function placeholdersIntact(text: string, count: number): boolean {
+  const found = text.match(/__BB\d+__/g) ?? [];
+  return found.length === count &&
+    Array.from({ length: count }, (_, i) => defaultPlaceholder(i))
+      .every((p) => found.filter((f) => f === p).length === 1);
+}
+
+/** Manual edits and imported translations must obey the same control-code contract. */
+export function controlCodesIntact(source: string, translated: string, pattern: RegExp = DEFAULT_PATTERN): boolean {
+  const tokens = (s: string): string[] => tokenize(s, pattern)
+    .filter((s) => s.kind === 'token').map((s) => s.value).sort();
+  return translated.trim().length > 0 &&
+    !/__BB\d+__|__GT\d+__/.test(translated) &&
+    JSON.stringify(tokens(source)) === JSON.stringify(tokens(translated));
 }

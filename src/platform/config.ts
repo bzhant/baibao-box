@@ -1,6 +1,8 @@
 import { app, safeStorage } from 'electron';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, rmSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
+import { positiveInteger, language } from '@shared/validation';
 import {
   API_PRESETS,
   defaultProfiles,
@@ -8,6 +10,7 @@ import {
   newProfileFromPreset,
   normalizeConfigFile,
   normalizeProfile,
+  isLocalProfile,
   upsertProfile as upsertIn,
   validateProfile,
   type ApiProfile,
@@ -105,11 +108,8 @@ function applyNormalized(raw: unknown): { file: ConfigFile; migrated: boolean } 
     file: {
       version: 2,
       config: {
-        defaultFrom: saved.defaultFrom ?? defaults.defaultFrom,
-        defaultTo: saved.defaultTo ?? defaults.defaultTo,
-        batchSize: saved.batchSize ?? defaults.batchSize,
-        concurrency: saved.concurrency ?? defaults.concurrency,
-        backupBeforeRepack: saved.backupBeforeRepack ?? defaults.backupBeforeRepack,
+        ...defaults,
+        ...normalizePreferences(saved, defaults),
         profiles: n.profiles,
         activeProfileId: n.activeProfileId,
       },
@@ -148,11 +148,36 @@ function load(): ConfigFile {
 function persist(): void {
   const p = configPath();
   mkdirSync(dirname(p), { recursive: true });
-  writeFileSync(p, JSON.stringify(load(), null, 2), 'utf8');
+  const temp = `${p}.${randomUUID()}.tmp`;
+  try {
+    writeFileSync(temp, JSON.stringify(load(), null, 2), { encoding: 'utf8', mode: 0o600 });
+    renameSync(temp, p);
+  } catch (e) {
+    // A rejected save must not remain active only in memory.
+    cached = null;
+    throw e;
+  } finally {
+    rmSync(temp, { force: true });
+  }
 }
 
 export function getConfig(): AppConfig {
-  return { ...load().config };
+  return structuredClone(load().config);
+}
+
+function normalizePreferences(saved: Partial<AppConfig>, defaults: AppConfig): Partial<AppConfig> {
+  const out: Partial<AppConfig> = {};
+  for (const key of ['defaultFrom', 'defaultTo', 'batchSize', 'concurrency'] as const) {
+    try {
+      (out as Record<string, unknown>)[key] = key === 'batchSize' || key === 'concurrency'
+        ? positiveInteger(saved[key], key, key === 'batchSize' ? 200 : 16)
+        : language(saved[key], key);
+    } catch {
+      (out as Record<string, unknown>)[key] = defaults[key];
+    }
+  }
+  out.backupBeforeRepack = true;
+  return out;
 }
 
 /**
@@ -163,7 +188,13 @@ export function getConfig(): AppConfig {
  */
 export function updateConfig(patch: Partial<AppConfig>): AppConfig {
   const f = load();
-  const { profiles: _p, activeProfileId: _a, ...safe } = patch;
+  const safe: Partial<AppConfig> = {};
+  if (patch.defaultFrom !== undefined) safe.defaultFrom = language(patch.defaultFrom, 'defaultFrom');
+  if (patch.defaultTo !== undefined) safe.defaultTo = language(patch.defaultTo, 'defaultTo');
+  if (patch.batchSize !== undefined) safe.batchSize = positiveInteger(patch.batchSize, 'batchSize', 200);
+  if (patch.concurrency !== undefined) safe.concurrency = positiveInteger(patch.concurrency, 'concurrency', 16);
+  if (patch.backupBeforeRepack === false) throw new Error('为保证可还原，不能关闭回写备份');
+  safe.backupBeforeRepack = true;
   f.config = { ...f.config, ...safe };
   persist();
   return { ...f.config };
@@ -320,7 +351,7 @@ export function configStatus(): {
   const f = load();
   const active = activeProfile();
   return {
-    hasApiKey: hasKeyFor(active.id),
+    hasApiKey: hasKeyFor(active.id) || isLocalProfile(active),
     secretEncrypted: f.apiKeys[active.id]?.encrypted ?? false,
     path: configPath(),
     config: { ...f.config },

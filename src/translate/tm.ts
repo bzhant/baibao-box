@@ -21,14 +21,22 @@ export class TranslationMemory {
   constructor(private readonly store: TextStore) {}
 
   /** 单条精确匹配 */
-  lookup(gameId: string, source: string): string | undefined {
-    return this.store.findTranslationBySource(source, gameId);
+  lookup(gameId: string, source: string, translationScope?: string): string | undefined {
+    return this.store.findTranslationBySource(source, gameId, translationScope);
   }
 
   /** 批量精确匹配（一次查完）。返回 source -> { translated, sameGame }，本游戏命中优先。 */
-  lookupBatch(gameId: string, sources: readonly string[]): Map<string, TmHit> {
+  lookupBatch(
+    gameId: string,
+    sources: readonly string[],
+    translationScope?: string,
+  ): Map<string, TmHit> {
     const out = new Map<string, TmHit>();
-    for (const [source, hit] of this.store.findTranslationsBySource(sources, gameId)) {
+    for (const [source, hit] of this.store.findTranslationsBySource(
+      sources,
+      gameId,
+      translationScope,
+    )) {
       out.set(source, { source, translated: hit.translated, sameGame: hit.sameGame });
     }
     return out;
@@ -38,8 +46,9 @@ export class TranslationMemory {
   partition(
     gameId: string,
     sources: readonly string[],
+    translationScope?: string,
   ): { hits: Map<string, TmHit>; misses: string[] } {
-    const hits = this.lookupBatch(gameId, sources);
+    const hits = this.lookupBatch(gameId, sources, translationScope);
     const misses = sources.filter((s) => !hits.has(s));
     return { hits, misses };
   }

@@ -219,8 +219,8 @@ export interface ProviderQuota {
 export interface TranslationProvider {
   id: string;
   displayName: string;
-  /** 批量翻译；实现方负责限流与并发 */
-  translate(reqs: TranslateRequest[]): Promise<TranslateResult[]>;
+  /** 批量翻译；调用方负责限流与并发，实现方应响应取消信号 */
+  translate(reqs: TranslateRequest[], options?: { signal?: AbortSignal }): Promise<TranslateResult[]>;
   /** 配额/余额（可选；本地模型可返回 {}） */
   quota?(): Promise<ProviderQuota>;
   /** 是否离线可用（本地模型 true） */

@@ -26,8 +26,12 @@ export class RateLimiter {
   private readonly waiters: Array<() => void> = [];
 
   constructor(opts: RateLimitOptions = {}) {
-    this.maxConcurrent = Math.max(1, opts.maxConcurrent ?? 4);
-    this.minIntervalMs = Math.max(0, opts.minIntervalMs ?? 0);
+    const concurrency = opts.maxConcurrent ?? 4;
+    const interval = opts.minIntervalMs ?? 0;
+    if (!Number.isSafeInteger(concurrency) || concurrency < 1) throw new Error('Invalid concurrency');
+    if (!Number.isFinite(interval) || interval < 0) throw new Error('Invalid rate interval');
+    this.maxConcurrent = concurrency;
+    this.minIntervalMs = interval;
   }
 
   private async acquire(): Promise<void> {
@@ -36,11 +40,10 @@ export class RateLimiter {
     }
     this.active++;
     const now = Date.now();
-    const gap = now - this.lastStart;
-    if (gap < this.minIntervalMs) {
-      await sleep(this.minIntervalMs - gap);
-    }
-    this.lastStart = Date.now();
+    // Reserve before awaiting so concurrent callers cannot share the same slot.
+    const start = Math.max(now, this.lastStart + this.minIntervalMs);
+    this.lastStart = start;
+    if (start > now) await sleep(start - now);
   }
 
   private release(): void {
@@ -61,7 +64,10 @@ export class RateLimiter {
 
   /** 执行一组任务（带限流），保序返回 */
   async runAll<T>(tasks: readonly (() => Promise<T>)[]): Promise<T[]> {
-    return Promise.all(tasks.map((t) => this.run(t)));
+    const results = await Promise.allSettled(tasks.map((t) => this.run(t)));
+    const failed = results.find((r): r is PromiseRejectedResult => r.status === 'rejected');
+    if (failed) throw failed.reason;
+    return results.map((r) => (r as PromiseFulfilledResult<T>).value);
   }
 
   /** 当前在飞任务数（测试/观测用） */

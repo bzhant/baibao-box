@@ -112,8 +112,11 @@ export class RuntimeSession {
   }
 
   /** 等原生侧连上并完成握手（它会自己应答 whoareyou）。 */
-  async waitForClient(timeoutMs = 15_000): Promise<{ no: number; identity: ClientIdentity }> {
-    this.connected = await this.bus.waitForClient(timeoutMs);
+  async waitForClient(
+    timeoutMs = 15_000,
+    signal?: AbortSignal,
+  ): Promise<{ no: number; identity: ClientIdentity }> {
+    this.connected = await this.bus.waitForClient(timeoutMs, signal);
     const id = this.connected.identity;
     logInfo(
       'runtime',

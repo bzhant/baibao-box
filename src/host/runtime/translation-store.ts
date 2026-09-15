@@ -1,5 +1,5 @@
-import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { logInfo, logWarn } from '@platform/logbus';
@@ -48,12 +48,21 @@ export function userDataDir(): string {
 }
 
 /**
- * 缓存文件路径：按**游戏路径**取哈希，一个游戏一份。
+ * 缓存文件路径：按**游戏路径 + 完整语言方向**隔离。
  * 放在用户数据目录而不是游戏目录 —— 不动玩家游戏里的任何文件。
  */
-export function cachePathFor(gameDir: string): string {
+export function cachePathFor(
+  gameDir: string,
+  from = 'ja',
+  to = 'zh-CN',
+): string {
   const h = createHash('sha1').update(gameDir.toLowerCase()).digest('hex').slice(0, 16);
-  return join(userDataDir(), 'runtime-cache', `${h}.json`);
+  const safe = (value: string): string => value.toLowerCase().replace(/[^a-z0-9-]/g, '-');
+  // 历史缓存没有语言后缀，且只代表默认的 ja -> zh-CN。
+  const suffix = from === 'ja' && to === 'zh-CN'
+    ? ''
+    : `-${safe(from)}-to-${safe(to)}`;
+  return join(userDataDir(), 'runtime-cache', `${h}${suffix}.json`);
 }
 
 /** 默认会在**游戏目录**里找的"外部译文字典"文件名（存在就自动吃进来） */
@@ -83,6 +92,7 @@ export class TranslationStore {
 
     if (existsSync(this.cachePath)) {
       try {
+        if (statSync(this.cachePath).size > 100 * 1024 * 1024) throw new Error('缓存文件超过 100 MB');
         const raw = JSON.parse(readFileSync(this.cachePath, 'utf8')) as unknown;
         if (isFlatDict(raw)) {
           for (const [k, v] of Object.entries(raw)) {
@@ -99,6 +109,10 @@ export class TranslationStore {
       const p = join(gameDir, name);
       if (!existsSync(p)) continue;
       try {
+        if (statSync(p).size > 100 * 1024 * 1024) {
+          logWarn('runtime', `${name} 超过 100 MB，跳过`);
+          continue;
+        }
         const raw = JSON.parse(readFileSync(p, 'utf8')) as unknown;
         if (!isFlatDict(raw)) {
           logWarn('runtime', `${name} 不是"平坦的 {原文:译文} 字典"，跳过`);
@@ -143,15 +157,20 @@ export class TranslationStore {
   /** 落盘（只在有新内容时写） */
   flush(): void {
     if (!this.dirty) return;
+    let temp = '';
     try {
       mkdirSync(dirname(this.cachePath), { recursive: true });
-      const obj: Record<string, string> = {};
+      const obj: Record<string, string> = Object.create(null) as Record<string, string>;
       for (const [k, v] of this.map) obj[k] = v;
-      writeFileSync(this.cachePath, JSON.stringify(obj, null, 0), 'utf8');
+      temp = `${this.cachePath}.${randomUUID()}.tmp`;
+      writeFileSync(temp, JSON.stringify(obj), { encoding: 'utf8', mode: 0o600 });
+      renameSync(temp, this.cachePath);
       this.dirty = false;
       logInfo('runtime', `译文缓存已保存：${this.map.size} 条 → ${this.cachePath}`);
     } catch (e) {
       logWarn('runtime', `译文缓存保存失败：${(e as Error).message}`);
+    } finally {
+      if (temp) rmSync(temp, { force: true });
     }
   }
 }

@@ -17,6 +17,7 @@ const CH = {
   pickGameDir: 'bb:pick-game-dir',
   detect: 'bb:detect',
   translate: 'bb:translate',
+  translateCancel: 'bb:translate-cancel',
   restore: 'bb:restore',
   reveal: 'bb:reveal',
   env: 'bb:env',
@@ -41,6 +42,12 @@ const CH = {
   runtimeStart: 'bb:runtime-start',
   runtimeStop: 'bb:runtime-stop',
   runtimeStatus: 'bb:runtime-status',
+  floatingOpen: 'bb:floating-open',
+  floatingClose: 'bb:floating-close',
+  floatingStatus: 'bb:floating-status',
+  floatingSetExpanded: 'bb:floating-set-expanded',
+  floatingSetPosition: 'bb:floating-set-position',
+  showMainWindow: 'bb:show-main-window',
   wbRepackPreview: 'bb:wb-repack-preview',
   wbRepack: 'bb:wb-repack',
   progress: 'bb:progress',
@@ -98,6 +105,8 @@ const api = {
     injectFont?: boolean;
     providerId?: string;
   }): Promise<IpcResult<{ started: true }>> => ipcRenderer.invoke(CH.translate, opts),
+  cancelTranslate: (): Promise<IpcResult<{ cancelled: boolean }>> =>
+    ipcRenderer.invoke(CH.translateCancel),
 
   /** 一键还原（回到翻译前） */
   restore: (gameDir: string): Promise<IpcResult<{
@@ -122,6 +131,16 @@ const api = {
   runtimeStop: (): Promise<IpcResult<unknown>> => ipcRenderer.invoke(CH.runtimeStop),
   /** 当前运行时会话状态（界面轮询它显示进度） */
   runtimeStatus: (): Promise<IpcResult<unknown>> => ipcRenderer.invoke(CH.runtimeStatus),
+  /** 开启 / 关闭悬浮窗（小型快速操作面板） */
+  floatingOpen: (): Promise<IpcResult<{ open: boolean }>> => ipcRenderer.invoke(CH.floatingOpen),
+  floatingClose: (): Promise<IpcResult<{ open: boolean }>> => ipcRenderer.invoke(CH.floatingClose),
+  floatingStatus: (): Promise<IpcResult<{ open: boolean; expanded: boolean }>> =>
+    ipcRenderer.invoke(CH.floatingStatus),
+  floatingSetExpanded: (expanded: boolean): Promise<IpcResult<{ open: boolean; expanded: boolean }>> =>
+    ipcRenderer.invoke(CH.floatingSetExpanded, expanded),
+  floatingSetPosition: (x: number, y: number): Promise<IpcResult<{ moved: boolean }>> =>
+    ipcRenderer.invoke(CH.floatingSetPosition, x, y),
+  showMainWindow: (): Promise<IpcResult<{ shown: true }>> => ipcRenderer.invoke(CH.showMainWindow),
 
   /** 环境信息 */
   env: (): Promise<IpcResult<{ dbPath: string; hasApiKey: boolean; translating: boolean }>> =>
@@ -173,27 +192,28 @@ const api = {
   /** 单条编辑：译文传 null = 清空回未译 */
   wbSave: (
     gameDir: string, path: string, key: string, translated: string | null, status?: string,
+    scope?: { from?: string; to?: string },
   ): Promise<IpcResult<{ changed: boolean }>> =>
-    ipcRenderer.invoke(CH.wbSave, gameDir, path, key, translated, status),
+    ipcRenderer.invoke(CH.wbSave, gameDir, path, key, translated, status, scope),
 
   /** 批量替换（dryRun=true 只预演并给样例） */
   wbBulk: (gameDir: string, opt: Record<string, unknown>): Promise<IpcResult<unknown>> =>
     ipcRenderer.invoke(CH.wbBulk, gameDir, opt),
 
   wbPickExport: (): Promise<IpcResult<string | null>> => ipcRenderer.invoke(CH.wbPickExport),
-  wbExport: (gameDir: string, outFile: string): Promise<IpcResult<unknown>> =>
-    ipcRenderer.invoke(CH.wbExport, gameDir, outFile),
+  wbExport: (gameDir: string, outFile: string, scope?: { from?: string; to?: string }): Promise<IpcResult<unknown>> =>
+    ipcRenderer.invoke(CH.wbExport, gameDir, outFile, scope),
   wbPickImport: (): Promise<IpcResult<string | null>> => ipcRenderer.invoke(CH.wbPickImport),
-  wbImport: (gameDir: string, inFile: string): Promise<IpcResult<unknown>> =>
-    ipcRenderer.invoke(CH.wbImport, gameDir, inFile),
+  wbImport: (gameDir: string, inFile: string, scope?: { from?: string; to?: string }): Promise<IpcResult<unknown>> =>
+    ipcRenderer.invoke(CH.wbImport, gameDir, inFile, scope),
 
   /** 回写前的预览：看清将要写什么（只统计 translated/reviewed，绝不写 pending/conflict） */
-  wbRepackPreview: (gameDir: string): Promise<IpcResult<unknown>> =>
-    ipcRenderer.invoke(CH.wbRepackPreview, gameDir),
+  wbRepackPreview: (gameDir: string, scope?: { from?: string; to?: string }): Promise<IpcResult<unknown>> =>
+    ipcRenderer.invoke(CH.wbRepackPreview, gameDir, scope),
 
   /** 只回写：把库里的译文落到游戏文件（适配器内部会自动备份） */
-  wbRepack: (gameDir: string): Promise<IpcResult<unknown>> =>
-    ipcRenderer.invoke(CH.wbRepack, gameDir),
+  wbRepack: (gameDir: string, scope?: { from?: string; to?: string }): Promise<IpcResult<unknown>> =>
+    ipcRenderer.invoke(CH.wbRepack, gameDir, scope),
 
   /** 订阅进度；返回取消订阅函数 */
   onProgress: (cb: (p: ProgressEvent) => void): (() => void) => {

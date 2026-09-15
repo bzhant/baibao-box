@@ -12,8 +12,14 @@ describe('翻译记忆（TM）', () => {
   });
   afterEach(() => store.close());
 
-  function seed(gameId: string, source: string, translated: string) {
+  function seed(
+    gameId: string,
+    source: string,
+    translated: string,
+    translationScope = 'ja>zh-CN',
+  ) {
     const path = `p/${source}`; // 用原文当 path，避免多条共用同一路径被互相覆盖
+    store.ensureGame(gameId, { translationScope });
     store.upsert(gameId, [{ engine: 'mvmz', path, key: 'k', source, status: 'pending' }]);
     store.setTranslation(gameId, path, 'k', translated);
   }
@@ -33,6 +39,15 @@ describe('翻译记忆（TM）', () => {
   it('跨游戏复用：本游戏没翻过，用其它游戏的', () => {
     seed('g2', 'もちろん', '当然');
     expect(tm.lookup('g1', 'もちろん')).toBe('当然'); // g1 没有 → 复用 g2
+  });
+
+  it('不同语言方向互相隔离', () => {
+    seed('g-zh', '同じ文', '同一句话', 'ja>zh-CN');
+    seed('g-en', '同じ文', 'Same sentence', 'ja>en');
+
+    expect(tm.lookup('new-zh', '同じ文', 'ja>zh-CN')).toBe('同一句话');
+    expect(tm.lookup('new-en', '同じ文', 'ja>en')).toBe('Same sentence');
+    expect(store.translatedSet('new-zh', 'global', 'ja>zh-CN')).toEqual(new Set(['同一句话']));
   });
 
   it('批量 partition：分成已命中与需机翻', () => {

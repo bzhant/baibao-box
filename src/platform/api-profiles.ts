@@ -95,7 +95,7 @@ export function normalizeProfile(raw: unknown, fallbackId = newId()): ApiProfile
   const profile: ApiProfile = {
     id,
     name: str(r['name']) || base?.name || '未命名方案',
-    baseUrl: str(r['baseUrl']).trim().replace(/\/+$/, ''),
+    baseUrl: str(r['baseUrl']).trim().replace(/\/+$/, '').replace(/\/chat\/completions$/i, ''),
     model: str(r['model']).trim(),
     preset,
   };
@@ -106,9 +106,23 @@ export function normalizeProfile(raw: unknown, fallbackId = newId()): ApiProfile
 export function validateProfile(p: ApiProfile): string | null {
   if (!p.name.trim()) return '方案名不能为空';
   if (!p.baseUrl.trim()) return '接口地址不能为空';
-  if (!/^https?:\/\//i.test(p.baseUrl)) return '接口地址要以 http:// 或 https:// 开头';
+  try {
+    const url = new URL(p.baseUrl);
+    if (!['http:', 'https:'].includes(url.protocol) || !url.hostname) return '接口地址要以 http:// 或 https:// 开头';
+    if (url.username || url.password || url.search || url.hash) return '接口地址不能包含账号、密码、查询参数或锚点';
+  } catch {
+    return '接口地址不是有效的 URL';
+  }
   if (!p.model.trim()) return '模型名不能为空';
   return null;
+}
+
+export function isLocalProfile(p: Pick<ApiProfile, 'baseUrl'>): boolean {
+  try {
+    return ['localhost', '127.0.0.1', '[::1]'].includes(new URL(p.baseUrl).hostname);
+  } catch {
+    return false;
+  }
 }
 
 /** 一把密钥在磁盘上的样子 */
@@ -146,6 +160,7 @@ export interface NormalizedConfig {
  */
 export function normalizeConfigFile(raw: RawConfigFile): NormalizedConfig {
   const cfg = raw.config ?? {};
+  let migrated = false;
   const keys: Record<string, StoredKey> = {};
   for (const [k, v] of Object.entries(raw.apiKeys ?? {})) {
     if (v && typeof v === 'object' && typeof (v as StoredKey).value === 'string') {
@@ -159,9 +174,19 @@ export function normalizeConfigFile(raw: RawConfigFile): NormalizedConfig {
     profiles = (cfg['profiles'] as unknown[])
       .map((p) => normalizeProfile(p))
       .filter((p): p is ApiProfile => p !== null);
+    const seen = new Set<string>();
+    profiles = profiles.map((p) => {
+      if (!seen.has(p.id)) {
+        seen.add(p.id);
+        return p;
+      }
+      migrated = true;
+      const id = newId();
+      seen.add(id);
+      return { ...p, id };
+    });
   }
 
-  let migrated = false;
   const oldKey = typeof raw.openaiApiKey === 'string' ? raw.openaiApiKey : '';
   if (profiles.length === 0) {
     if (oldKey) {

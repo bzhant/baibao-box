@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
+  controlCodesIntact,
   tokenize,
   mask,
   unmask,
@@ -66,5 +67,12 @@ describe('control-codes: 质量自检', () => {
     // 模拟 MT 把 __BB1__ 翻没了、__BB0__ 保留
     const translated = `你好${defaultPlaceholder(0)}世界`;
     expect(missingPlaceholders(translated, 2)).toEqual([1]);
+  });
+
+  it('人工译文必须完整保留控制符，且不能残留内部占位符', () => {
+    expect(controlCodesIntact('こんにちは\\N[1]', '你好\\N[1]')).toBe(true);
+    expect(controlCodesIntact('こんにちは\\N[1]', '你好')).toBe(false);
+    expect(controlCodesIntact('こんにちは\\N[1]', '你好\\N[2]')).toBe(false);
+    expect(controlCodesIntact('こんにちは', '你好__BB0__')).toBe(false);
   });
 });

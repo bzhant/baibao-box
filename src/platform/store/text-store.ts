@@ -38,6 +38,7 @@ export interface GameMeta {
   dir?: string;
   engineId?: string;
   engineVersion?: string;
+  translationScope?: string;
 }
 
 /** 原文指纹：用于检测原文变更 */
@@ -88,15 +89,42 @@ export class TextStore {
   /** 确保游戏记录存在（upsert 的前置）。 */
   ensureGame(gameId: string, meta: GameMeta = {}): void {
     this.db
-      .prepare('INSERT OR IGNORE INTO game(id,title,dir,engine_id,engine_version,added_at) VALUES(?,?,?,?,?,?)')
-      .run(gameId, meta.title ?? gameId, meta.dir ?? '', meta.engineId ?? null, meta.engineVersion ?? null, Date.now());
+      .prepare(
+        `INSERT OR IGNORE INTO game
+          (id,title,dir,engine_id,engine_version,translation_scope,added_at)
+         VALUES(?,?,?,?,?,?,?)`,
+      )
+      .run(
+        gameId,
+        meta.title ?? gameId,
+        meta.dir ?? '',
+        meta.engineId ?? null,
+        meta.engineVersion ?? null,
+        meta.translationScope ?? 'ja>zh-CN',
+        Date.now(),
+      );
+    if (meta.translationScope) {
+      this.db
+        .prepare('UPDATE game SET translation_scope=? WHERE id=?')
+        .run(meta.translationScope, gameId);
+    }
   }
 
   getGame(gameId: string): (GameMeta & { id: string; addedAt: number }) | undefined {
     const r = this.db
-      .prepare('SELECT id,title,dir,engine_id,engine_version,added_at FROM game WHERE id=?')
+      .prepare(
+        'SELECT id,title,dir,engine_id,engine_version,translation_scope,added_at FROM game WHERE id=?',
+      )
       .get(gameId) as
-      | { id: string; title: string; dir: string; engine_id: string | null; engine_version: string | null; added_at: number }
+      | {
+          id: string;
+          title: string;
+          dir: string;
+          engine_id: string | null;
+          engine_version: string | null;
+          translation_scope: string;
+          added_at: number;
+        }
       | undefined;
     if (!r) return undefined;
     return {
@@ -105,6 +133,7 @@ export class TextStore {
       dir: r.dir,
       engineId: r.engine_id ?? undefined,
       engineVersion: r.engine_version ?? undefined,
+      translationScope: r.translation_scope,
       addedAt: r.added_at,
     };
   }
@@ -266,17 +295,27 @@ export class TextStore {
    * 翻译记忆（TM）：按原文精确匹配，返回此前译过的译文。
    * 同游戏的命中优先，其次是其它游戏的（跨游戏复用常见短语，省钱）。
    */
-  findTranslationBySource(source: string, gameId?: string): string | undefined {
+  findTranslationBySource(
+    source: string,
+    gameId?: string,
+    translationScope?: string,
+  ): string | undefined {
     const row = this.db
       .prepare(
-        `SELECT translated FROM text_entry
-         WHERE source = @source
-           AND translated IS NOT NULL AND translated <> ''
-           AND status IN ('translated','reviewed')
-         ORDER BY (game_id = @gameId) DESC, updated_at DESC
+        `SELECT e.translated FROM text_entry e
+         JOIN game g ON g.id = e.game_id
+         WHERE e.source = @source
+           AND e.translated IS NOT NULL AND e.translated <> ''
+           AND e.status IN ('translated','reviewed')
+           AND (@translationScope = '' OR g.translation_scope = @translationScope)
+         ORDER BY (e.game_id = @gameId) DESC, e.updated_at DESC
          LIMIT 1`,
       )
-      .get({ source, gameId: gameId ?? '' }) as { translated: string } | undefined;
+      .get({
+        source,
+        gameId: gameId ?? '',
+        translationScope: translationScope ?? '',
+      }) as { translated: string } | undefined;
     return row?.translated;
   }
 
@@ -284,20 +323,28 @@ export class TextStore {
   findTranslationsBySource(
     sources: readonly string[],
     gameId?: string,
+    translationScope?: string,
   ): Map<string, { translated: string; sameGame: boolean }> {
     const out = new Map<string, { translated: string; sameGame: boolean }>();
     if (sources.length === 0) return out;
     const stmt = this.db.prepare(
-      `SELECT source, translated, (game_id = @gameId) AS sameGame FROM text_entry
-       WHERE source = @source
-         AND translated IS NOT NULL AND translated <> ''
-         AND status IN ('translated','reviewed')
+      `SELECT e.source, e.translated, (e.game_id = @gameId) AS sameGame
+       FROM text_entry e
+       JOIN game g ON g.id = e.game_id
+       WHERE e.source = @source
+         AND e.translated IS NOT NULL AND e.translated <> ''
+         AND e.status IN ('translated','reviewed')
+         AND (@translationScope = '' OR g.translation_scope = @translationScope)
        ORDER BY sameGame DESC, updated_at DESC
        LIMIT 1`,
     );
     const run = this.db.transaction((list: readonly string[]) => {
       for (const s of list) {
-        const row = stmt.get({ source: s, gameId: gameId ?? '' }) as
+        const row = stmt.get({
+          source: s,
+          gameId: gameId ?? '',
+          translationScope: translationScope ?? '',
+        }) as
           | { source: string; translated: string; sameGame: number }
           | undefined;
         if (row && !out.has(row.source)) {
@@ -320,17 +367,26 @@ export class TextStore {
    * 只按 gameId 查会漏判，结果是 【中】【中】 双重翻译。
    * 代价：若将来做 zh→en，别处存的中文译文可能误命中 —— 那种场景传 'game' 收窄。
    */
-  translatedSet(gameId: string, scope: 'global' | 'game' = 'global'): Set<string> {
+  translatedSet(
+    gameId: string,
+    scope: 'global' | 'game' = 'global',
+    translationScope?: string,
+  ): Set<string> {
     // 只收 translated / reviewed —— 这两种才是"确实写进过游戏文件"的译文。
     // conflict 没写回游戏，不该参与反向匹配。
     const rows = this.db
       .prepare(
-        `SELECT DISTINCT translated FROM text_entry
-         WHERE translated IS NOT NULL AND translated<>''
-           AND status IN ('translated','reviewed')
-           ${scope === 'game' ? 'AND game_id = ?' : ''}`,
+        `SELECT DISTINCT e.translated FROM text_entry e
+         JOIN game g ON g.id = e.game_id
+         WHERE e.translated IS NOT NULL AND e.translated<>''
+           AND e.status IN ('translated','reviewed')
+           ${scope === 'game' ? 'AND e.game_id = @gameId' : ''}
+           AND (@translationScope = '' OR g.translation_scope = @translationScope)`,
       )
-      .all(...(scope === 'game' ? [gameId] : [])) as Array<{ translated: string }>;
+      .all({
+        gameId,
+        translationScope: translationScope ?? '',
+      }) as Array<{ translated: string }>;
     return new Set(rows.map((r) => r.translated));
   }
 

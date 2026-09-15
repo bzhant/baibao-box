@@ -1,5 +1,6 @@
 import { promises as fs } from 'node:fs';
-import { join, dirname, relative, sep } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { join, dirname, relative, sep, isAbsolute, normalize, resolve, basename } from 'node:path';
 
 /**
  * 通用"打补丁"机制：**先备份、留清单、可一键还原**。
@@ -45,7 +46,7 @@ export interface PatchManifest {
 const BACKUP_ROOT = '.baibao-backup';
 
 function stamp(): string {
-  return new Date().toISOString().replace(/[:.]/g, '-');
+  return `${new Date().toISOString().replace(/[:.]/g, '-')}-${randomUUID().slice(0, 8)}`;
 }
 
 function safeName(rel: string): string {
@@ -55,6 +56,49 @@ function safeName(rel: string): string {
 const toBuffer = (c: string | Buffer): Buffer =>
   typeof c === 'string' ? Buffer.from(c, 'utf8') : c;
 
+function safeRel(rel: string): string {
+  const clean = normalize(rel).split(sep).join('/');
+  if (!clean || clean === '.' || isAbsolute(rel) || clean === '..' || clean.startsWith('../') || clean.includes('\0')) {
+    throw new Error(`[patch] 非法相对路径：${rel}`);
+  }
+  return clean;
+}
+
+function targetPath(gameDir: string, rel: string): string {
+  const root = resolve(gameDir);
+  const target = resolve(root, safeRel(rel));
+  if (target !== root && !target.startsWith(`${root}${sep}`)) throw new Error(`[patch] 路径越界：${rel}`);
+  return target;
+}
+
+function targetKey(gameDir: string, rel: string): string {
+  const target = targetPath(gameDir, rel);
+  if (process.platform !== 'win32') return target;
+  return target
+    .split(sep)
+    .map((part) => part.replace(/[ .]+$/g, '').toLowerCase())
+    .join(sep);
+}
+
+async function assertContained(gameDir: string, target: string): Promise<void> {
+  const root = await fs.realpath(resolve(gameDir));
+  let probe = resolve(target);
+  for (;;) {
+    try {
+      const real = await fs.realpath(probe);
+      if (real !== root && !real.startsWith(`${root}${sep}`)) {
+        throw new Error(`[patch] 路径经过符号链接越界：${target}`);
+      }
+      return;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e;
+      const parent = dirname(probe);
+      if (parent === probe) throw e;
+      probe = parent;
+    }
+  }
+}
+
 /**
  * 应用补丁：写文件 + 备份原文件 + 落清单。
  * 任何一步失败都不会留下"改了一半"的状态（已写文件会回滚）。
@@ -63,15 +107,26 @@ export async function applyPatch(
   gameDir: string,
   opts: { label: string; engine: string; files: readonly PatchFileInput[] },
 ): Promise<PatchManifest> {
+  const seen = new Set<string>();
+  const inputs = opts.files.map((file) => {
+    const rel = safeRel(file.rel);
+    const key = targetKey(gameDir, rel);
+    if (seen.has(key)) throw new Error(`[patch] 同一个文件不能在一次补丁中出现两次：${rel}`);
+    seen.add(key);
+    return { ...file, rel };
+  });
   const backupDir = join(gameDir, BACKUP_ROOT, stamp());
   const filesDir = join(backupDir, 'files');
+  await assertContained(gameDir, filesDir);
   await fs.mkdir(filesDir, { recursive: true });
 
   const changes: PatchChange[] = [];
 
   try {
-    for (const f of opts.files) {
-      const abs = join(gameDir, f.rel);
+    for (const f of inputs) {
+      const rel = f.rel;
+      const abs = targetPath(gameDir, rel);
+      await assertContained(gameDir, abs);
       const next = toBuffer(f.content);
 
       let prev: Buffer | null = null;
@@ -83,42 +138,56 @@ export async function applyPatch(
       if (prev && prev.equals(next)) continue; // 无需改动
 
       // 红线：改之前先备份原始字节
-      if (prev) await fs.writeFile(join(filesDir, safeName(f.rel)), prev);
+      if (prev) {
+        const backup = join(filesDir, rel);
+        await fs.mkdir(dirname(backup), { recursive: true });
+        await fs.writeFile(backup, prev);
+      }
 
       await fs.mkdir(dirname(abs), { recursive: true });
-      await fs.writeFile(abs, next);
       changes.push({
-        rel: f.rel,
+        rel,
         existed: prev !== null,
         bytesBefore: prev ? prev.length : 0,
         bytesAfter: next.length,
       });
+      await fs.writeFile(abs, next);
     }
+    const manifest: PatchManifest = {
+      version: 1,
+      label: opts.label,
+      engine: opts.engine,
+      appliedAt: Date.now(),
+      backupDir,
+      changes,
+    };
+    await fs.writeFile(join(backupDir, 'manifest.json'), JSON.stringify(manifest, null, 2), 'utf8');
+    return manifest;
   } catch (err) {
     // 回滚：有备份的写回，没备份的删掉
     for (const c of changes) {
-      const abs = join(gameDir, c.rel);
-      const bak = join(filesDir, safeName(c.rel));
+      const abs = targetPath(gameDir, c.rel);
+      const nested = join(filesDir, c.rel);
+      const legacy = join(filesDir, safeName(c.rel));
       try {
-        if (c.existed) await fs.copyFile(bak, abs);
+        if (c.existed) await fs.copyFile(await exists(nested) ? nested : legacy, abs);
         else await fs.rm(abs, { force: true });
       } catch {
         /* 尽力而为 */
       }
     }
+    await fs.rm(backupDir, { recursive: true, force: true }).catch(() => undefined);
     throw new Error(`[patch] 应用失败已回滚: ${(err as Error).message}`);
   }
+}
 
-  const manifest: PatchManifest = {
-    version: 1,
-    label: opts.label,
-    engine: opts.engine,
-    appliedAt: Date.now(),
-    backupDir,
-    changes,
-  };
-  await fs.writeFile(join(backupDir, 'manifest.json'), JSON.stringify(manifest, null, 2), 'utf8');
-  return manifest;
+async function exists(path: string): Promise<boolean> {
+  try {
+    await fs.access(path);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** 列出某游戏的所有补丁（按时间倒序） */
@@ -147,17 +216,21 @@ export async function restorePatch(
   gameDir: string,
   manifest: PatchManifest,
 ): Promise<{ restored: number; errors: string[] }> {
-  const filesDir = join(manifest.backupDir, 'files');
+  const backupDir = join(resolve(gameDir), BACKUP_ROOT, basename(manifest.backupDir));
+  await assertContained(gameDir, backupDir);
+  const filesDir = join(backupDir, 'files');
   const errors: string[] = [];
   let restored = 0;
 
   for (const c of manifest.changes) {
-    const abs = join(gameDir, c.rel);
-    const bak = join(filesDir, safeName(c.rel));
     try {
+      const abs = targetPath(gameDir, c.rel);
+      await assertContained(gameDir, abs);
+      const nested = join(filesDir, safeRel(c.rel));
+      const legacy = join(filesDir, safeName(c.rel));
       if (c.existed) {
         await fs.mkdir(dirname(abs), { recursive: true });
-        await fs.copyFile(bak, abs); // 按字节还原，编码不会丢
+        await fs.copyFile(await exists(nested) ? nested : legacy, abs); // 兼容旧版平铺备份
       } else {
         await fs.rm(abs, { force: true });
       }
@@ -167,10 +240,12 @@ export async function restorePatch(
     }
   }
 
-  manifest.restoredAt = Date.now();
-  await fs
-    .writeFile(join(manifest.backupDir, 'manifest.json'), JSON.stringify(manifest, null, 2), 'utf8')
-    .catch(() => {});
+  if (errors.length === 0) {
+    manifest.restoredAt = Date.now();
+    await fs
+      .writeFile(join(backupDir, 'manifest.json'), JSON.stringify(manifest, null, 2), 'utf8')
+      .catch(() => {});
+  }
   return { restored, errors };
 }
 
@@ -197,6 +272,7 @@ export async function restoreAll(
     out.restored += r.restored;
     out.errors.push(...r.errors);
     out.patches++;
+    if (r.errors.length > 0) break;
   }
   return out;
 }
@@ -207,7 +283,9 @@ export async function readBackupFile(
   rel: string,
 ): Promise<Buffer | null> {
   try {
-    return await fs.readFile(join(manifest.backupDir, 'files', safeName(rel)));
+    const nested = join(manifest.backupDir, 'files', safeRel(rel));
+    const legacy = join(manifest.backupDir, 'files', safeName(rel));
+    return await fs.readFile(await exists(nested) ? nested : legacy);
   } catch {
     return null;
   }

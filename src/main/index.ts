@@ -1,9 +1,13 @@
-import { app, BrowserWindow, shell } from 'electron';
+import { app, BrowserWindow, dialog, screen, shell } from 'electron';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { registerBuiltinPlugins } from './bootstrap-plugins';
 import { runCli } from './cli';
 import { registerIpc, runningGameDir } from './ipc';
 import { initPlatform, closePlatform, dbPath } from '@platform/init';
+import { logWarn } from '@platform/logbus';
+import { isRuntimeActive, stopRuntime } from './runtime-service';
 
 /**
  * Electron 主进程入口（shell 层）。
@@ -40,8 +44,46 @@ if (process.argv.some((a) => NO_GPU_FLAGS.includes(a))) {
   app.commandLine.appendSwitch('in-process-gpu');
 }
 
-/** 当前主窗口。IPC 需要它来做两件事：给系统对话框找父窗口、往渲染层推进度。 */
+/** 主窗口与悬浮窗。IPC 需要它们来做父窗口挂载、以及向所有界面广播进度。 */
 let mainWindow: BrowserWindow | null = null;
+let floatingWindow: BrowserWindow | null = null;
+let floatingExpanded = false;
+let isQuitting = false;
+
+const FLOATING_COLLAPSED = { width: 28, height: 28 };
+const FLOATING_EXPANDED = { width: 296, height: 202 };
+
+function loadRenderer(win: BrowserWindow, view: 'main' | 'floating' = 'main'): void {
+  const hash = view === 'floating' ? 'floating' : '';
+  if (process.env['ELECTRON_RENDERER_URL']) {
+    const url = process.env['ELECTRON_RENDERER_URL'];
+    void win.loadURL(hash ? `${url}#${hash}` : url);
+    return;
+  }
+  void win.loadFile(join(__dirname, '../renderer/index.html'), hash ? { hash } : {});
+}
+
+function focusWindow(win: BrowserWindow): BrowserWindow {
+  if (win.isMinimized()) win.restore();
+  win.show();
+  win.focus();
+  return win;
+}
+
+function attachExternalNavigationGuard(win: BrowserWindow): void {
+  // 外部链接一律交给系统浏览器，不在应用内开新窗
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    try {
+      const protocol = new URL(url).protocol;
+      if (protocol === 'https:' || protocol === 'http:' || protocol === 'mailto:') {
+        void shell.openExternal(url);
+      }
+    } catch {
+      // Ignore malformed and privileged protocols.
+    }
+    return { action: 'deny' };
+  });
+}
 
 function createMainWindow(): BrowserWindow {
   const win = new BrowserWindow({
@@ -50,12 +92,15 @@ function createMainWindow(): BrowserWindow {
     minWidth: 960,
     minHeight: 640,
     title: '白的百宝箱',
+    titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
+    trafficLightPosition: process.platform === 'darwin' ? { x: 18, y: 18 } : undefined,
     backgroundColor: '#0f1115',
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
-      sandbox: false, // better-sqlite3 等原生模块需要；后续收敛为 contextIsolation + 白名单 IPC
+      sandbox: true,
       contextIsolation: true,
       nodeIntegration: false,
+      spellcheck: false,
     },
   });
 
@@ -64,17 +109,8 @@ function createMainWindow(): BrowserWindow {
     if (mainWindow === win) mainWindow = null;
   });
 
-  // 外部链接一律交给系统浏览器，不在应用内开新窗
-  win.webContents.setWindowOpenHandler(({ url }) => {
-    shell.openExternal(url);
-    return { action: 'deny' };
-  });
-
-  if (process.env['ELECTRON_RENDERER_URL']) {
-    win.loadURL(process.env['ELECTRON_RENDERER_URL']);
-  } else {
-    win.loadFile(join(__dirname, '../renderer/index.html'));
-  }
+  attachExternalNavigationGuard(win);
+  loadRenderer(win);
 
   // 冒烟测试钩子（CI / 自动化用）：渲染层加载完成后做平台层自检并退出，不需要外部 kill。
   //   electron . --smoke-test
@@ -117,6 +153,130 @@ function createMainWindow(): BrowserWindow {
   return win;
 }
 
+function createFloatingWindow(): BrowserWindow {
+  const { width, height } = FLOATING_COLLAPSED;
+  const anchor = mainWindow && !mainWindow.isDestroyed() ? mainWindow.getBounds() : null;
+  const win = new BrowserWindow({
+    width,
+    height,
+    x: anchor ? anchor.x + Math.max(24, anchor.width - width - 28) : undefined,
+    y: anchor ? anchor.y + 76 : undefined,
+    title: '白的百宝箱 · 悬浮窗',
+    show: false,
+    frame: false,
+    transparent: true,
+    resizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    skipTaskbar: true,
+    alwaysOnTop: true,
+    hasShadow: false,
+    roundedCorners: true,
+    backgroundColor: '#00000000',
+    webPreferences: {
+      preload: join(__dirname, '../preload/index.js'),
+      sandbox: true,
+      contextIsolation: true,
+      nodeIntegration: false,
+      spellcheck: false,
+    },
+  });
+
+  floatingWindow = win;
+  floatingExpanded = false;
+  win.on('closed', () => {
+    if (floatingWindow === win) floatingWindow = null;
+    floatingExpanded = false;
+    if (
+      !isQuitting
+      && mainWindow
+      && !mainWindow.isDestroyed()
+      && !mainWindow.isVisible()
+    ) {
+      focusWindow(mainWindow);
+    }
+  });
+  win.setAlwaysOnTop(true);
+  win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+  attachExternalNavigationGuard(win);
+  loadRenderer(win, 'floating');
+  win.once('ready-to-show', () => {
+    if (floatingWindow === win) focusWindow(win);
+  });
+  return win;
+}
+
+function showMainWindow(): BrowserWindow {
+  if (floatingWindow && !floatingWindow.isDestroyed()) floatingWindow.close();
+  const win = !mainWindow || mainWindow.isDestroyed() ? createMainWindow() : mainWindow;
+  return focusWindow(win);
+}
+
+function openFloatingWindow(): BrowserWindow {
+  const win = !floatingWindow || floatingWindow.isDestroyed()
+    ? createFloatingWindow()
+    : floatingWindow;
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.hide();
+  setFloatingExpanded(false);
+  if (win.isVisible()) focusWindow(win);
+  return win;
+}
+
+function closeFloatingWindow(): boolean {
+  if (!floatingWindow || floatingWindow.isDestroyed()) return false;
+  showMainWindow();
+  return true;
+}
+
+function setFloatingExpanded(expanded: boolean): boolean {
+  const win = floatingWindow;
+  if (!win || win.isDestroyed()) return false;
+
+  const current = win.getBounds();
+  const target = expanded ? FLOATING_EXPANDED : FLOATING_COLLAPSED;
+  const display = screen.getDisplayMatching(current).workArea;
+  const right = current.x + current.width;
+  const x = Math.min(
+    display.x + display.width - target.width,
+    Math.max(display.x, right - target.width),
+  );
+  const y = Math.min(
+    display.y + display.height - target.height,
+    Math.max(display.y, current.y),
+  );
+
+  floatingExpanded = expanded;
+  win.setBounds({ x, y, width: target.width, height: target.height }, true);
+  return true;
+}
+
+function setFloatingPosition(x: number, y: number): boolean {
+  const win = floatingWindow;
+  if (!win || win.isDestroyed()) return false;
+
+  const bounds = win.getBounds();
+  const display = screen.getDisplayNearestPoint({
+    x: x + Math.round(bounds.width / 2),
+    y: y + Math.round(bounds.height / 2),
+  }).workArea;
+  const nextX = Math.min(
+    display.x + display.width - bounds.width,
+    Math.max(display.x, Math.round(x)),
+  );
+  const nextY = Math.min(
+    display.y + display.height - bounds.height,
+    Math.max(display.y, Math.round(y)),
+  );
+  win.setPosition(nextX, nextY, false);
+  return true;
+}
+
+function getOpenWindows(): BrowserWindow[] {
+  return [mainWindow, floatingWindow].filter(
+    (win): win is BrowserWindow => !!win && !win.isDestroyed(),
+  );
+}
+
 /**
  * CLI 模式：带这些参数时**不开窗**，跑完即退（headless）。
  *
@@ -129,11 +289,29 @@ function createMainWindow(): BrowserWindow {
  */
 const CLI_FLAGS = ['--game', '--restore', '--repack-only', '--help', '-h', '--runtime', '--runtime-restore', '--test-api'];
 const isCliMode = process.argv.some((a) => CLI_FLAGS.includes(a));
+const isSmokeTest = process.argv.includes('--smoke-test');
+const hasSingleInstanceLock = isCliMode || isSmokeTest || app.requestSingleInstanceLock();
+if (!hasSingleInstanceLock) app.quit();
+if (!isCliMode && !isSmokeTest) {
+  app.on('second-instance', () => {
+    if (floatingWindow && !floatingWindow.isDestroyed()) {
+      focusWindow(floatingWindow);
+      return;
+    }
+    if (mainWindow && !mainWindow.isDestroyed()) focusWindow(mainWindow);
+    else showMainWindow();
+  });
+}
+const smokeUserData = isSmokeTest
+  ? mkdtempSync(join(tmpdir(), 'baibao-smoke-'))
+  : null;
+if (smokeUserData) app.setPath('userData', smokeUserData);
 
 // 关硬件加速的判定已在上方 `NO_GPU_FLAGS` 处统一处理（含 CLI / --smoke-test / --disable-gpu），
 // 这里不再重复；加新 CLI 参数时**两处都要同步**。
 
 app.whenReady().then(async () => {
+  if (!hasSingleInstanceLock) return;
   registerBuiltinPlugins(); // 注册内置引擎适配器 / 翻译 Provider（幂等）
 
   if (isCliMode) {
@@ -145,32 +323,73 @@ app.whenReady().then(async () => {
   // ★ IPC 只注册一次。`ipcMain.handle` 对同一通道重复注册会直接抛异常，
   //   所以放在这里（而不是 createMainWindow 里）—— 窗口可能被重建多次
   //   （macOS 点 dock 图标、或以后做"多窗口"时），但 IPC 只该注册一次。
-  registerIpc(() => mainWindow);
+  registerIpc(
+    () => mainWindow,
+    {
+      getWindows: getOpenWindows,
+      showMainWindow,
+      openFloatingWindow,
+      closeFloatingWindow,
+      isFloatingOpen: () => !!floatingWindow && !floatingWindow.isDestroyed(),
+      isFloatingExpanded: () => floatingExpanded,
+      setFloatingExpanded,
+      setFloatingPosition,
+    },
+  );
 
   createMainWindow();
 
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createMainWindow();
+    if (floatingWindow && !floatingWindow.isDestroyed()) focusWindow(floatingWindow);
+    else showMainWindow();
   });
 });
 
 app.on('window-all-closed', () => {
+  if (isRuntimeActive() || runningGameDir()) {
+    showMainWindow();
+    return;
+  }
   if (process.platform !== 'darwin') app.quit();
 });
 
 // 退出前关闭文本库，确保 WAL 落盘
 app.on('will-quit', () => {
   closePlatform();
+  if (smokeUserData) rmSync(smokeUserData, { recursive: true, force: true });
 });
 
-// 翻译中途退出是很糟的体验：游戏文件可能只写了一半。
-// 这里至少把事实说清楚（打日志），而不是静默退出。
-app.on('before-quit', () => {
+// 文件任务结束前阻止退出，避免进程在回写中途被截断。
+let runtimeCleanupStarted = false;
+app.on('before-quit', (event) => {
+  if (isRuntimeActive() && !runtimeCleanupStarted) {
+    event.preventDefault();
+    runtimeCleanupStarted = true;
+    void stopRuntime()
+      .then(() => app.quit())
+      .catch((e) => {
+        runtimeCleanupStarted = false;
+        showMainWindow();
+        dialog.showErrorBox(
+          '游戏文件尚未还原',
+          `${(e as Error).message}\n\n应用将保持打开。请解除文件占用或修复权限后，再点击「结束并还原」。`,
+        );
+      });
+    return;
+  }
   const g = runningGameDir();
   if (g) {
-    console.warn(
-      `[bb] 应用在翻译进行中退出（游戏：${g}）。\n` +
-      `     已写入的部分不会自动回滚 —— 建议下次启动后用界面的"一键还原"回到翻译前状态。`,
-    );
+    event.preventDefault();
+    logWarn('lifecycle', `应用退出时仍有任务运行，已阻止退出：${g}`);
+    showMainWindow();
+    dialog.showMessageBoxSync({
+      type: 'warning',
+      title: '汉化任务尚未结束',
+      message: '当前仍在处理游戏文件。',
+      detail: '请等待任务完成，或在汉化页点击「取消任务」，确认任务结束后再退出。',
+      buttons: ['返回应用'],
+    });
+    return;
   }
+  isQuitting = true;
 });
