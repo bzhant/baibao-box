@@ -11,7 +11,7 @@ import {
   testProfile,
   type TranslateOutcome,
 } from './translate-service';
-import { listProfiles } from '@platform/config';
+import { getConfig, listProfiles } from '@platform/config';
 import type { PipelineProgress } from '../pipeline/translate-pipeline';
 import {
   cleanupGameDir,
@@ -210,7 +210,16 @@ export async function runCli(argv: readonly string[]): Promise<number> {
     if (args.runtime) {
       // Provider 在**这里**解析（命令行与界面各自解析，服务只负责编排）
       const { provider, autoStub, profileName } = pickProvider(args.provider);
-      const r = await startRuntime({ gameDir: args.runtime, provider, providerName: profileName, autoStub });
+      const cfg = getConfig();
+      const r = await startRuntime({
+        gameDir: args.runtime,
+        provider,
+        providerName: profileName,
+        autoStub,
+        from: args.from || cfg.defaultFrom,
+        to: args.to || cfg.defaultTo,
+        batchSize: cfg.batchSize,
+      });
       console.log('\n──── 运行时汉化（一键）────────────────');
       console.log(`  引擎            ${r.engine}（运行时桥）`);
       console.log(`  翻译接口        ${r.providerName}${r.autoStub ? '  ⚠ 没配密钥，降级为本地假机翻' : ''}`);
@@ -234,6 +243,11 @@ export async function runCli(argv: readonly string[]): Promise<number> {
         console.log(`  命中本地译文库  ${s.localHits ?? 0} 条`);
         console.log(`  调用翻译接口    ${s.apiCalls ?? 0} 次 / 送出 ${s.apiSent ?? 0} 条 / 得译文 ${s.apiGot ?? 0} 条`);
         console.log(`  译文库          ${s.storeSize ?? 0} 条（下次启动直接命中）`);
+        if (s.cleanupError) {
+          console.error(`  ✗ 游戏文件自动还原失败：${s.cleanupError}`);
+          console.error('    请修复占用/权限问题后执行 --runtime-restore 再试。');
+          return 1;
+        }
       }
       console.log('  ✓ 游戏文件已还原（逐字节 + 哈希校验）');
       return 0;
@@ -261,7 +275,8 @@ export async function runCli(argv: readonly string[]): Promise<number> {
 
     // ── 只回写模式（把工作台里改好的译文落进游戏，不重跑整条流水线）──
     if (args.repackOnly) {
-      const pv = await previewRepack(args.game);
+      const scope = { from: args.from, to: args.to };
+      const pv = await previewRepack(args.game, scope);
       console.log(`引擎：${pv.engineName}（${pv.engineId}）`);
       console.log(
         `将要回写 ${pv.willWrite} 条　（已译 ${pv.counts.translated} / 已复核 ${pv.counts.reviewed}` +
@@ -278,7 +293,7 @@ export async function runCli(argv: readonly string[]): Promise<number> {
       }
       const out = await repackGame(args.game, (p2) => {
         if (p2.phase === 'repack') process.stdout.write(`\r  回写 ${p2.current}/${p2.total}  `);
-      });
+      }, scope);
       process.stdout.write('\n');
       const r = out.repack;
       console.log(`  写入 ${r.written} · 无需改动 ${r.unchanged} · 跳过 ${r.skipped}`);

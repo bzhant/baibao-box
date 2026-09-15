@@ -11,7 +11,8 @@ import type { TextStore, UpsertResult } from '@platform/store/text-store';
 import {
   mask,
   unmask,
-  missingPlaceholders,
+  placeholdersIntact,
+  controlCodesIntact,
   defaultPlaceholder,
 } from '../text-kernel/control-codes';
 import { patternFor } from '../text-kernel/patterns';
@@ -25,6 +26,7 @@ import {
 import { TranslationMemory } from '../translate/tm';
 import { checkQuality, hasHardIssue, summarizeSoft, type LengthPair } from '../translate/quality';
 import { RateLimiter, type RateLimitOptions } from '../translate/rate-limiter';
+import { positiveInteger } from '@shared/validation';
 
 /**
  * 汉化流水线（骨架 → 内核）：
@@ -88,6 +90,7 @@ export interface PipelineOptions {
   /** 长度比质检的语种对，默认 cjk-cjk */
   lengthPair?: LengthPair;
   onProgress?: (p: PipelineProgress) => void;
+  signal?: AbortSignal;
 }
 
 export interface PipelineReport {
@@ -116,6 +119,7 @@ export interface PipelineReport {
   font?: FontInjectOutcome;
   errors: string[];
   durationMs: number;
+  cancelled?: boolean;
 }
 
 /** 上下文提示：带上一条原句，帮 Provider 判断语气/人称 */
@@ -130,8 +134,12 @@ function contextHint(entries: readonly TextEntry[], idx: number): string | undef
 
 export async function runPipeline(opts: PipelineOptions): Promise<PipelineReport> {
   const t0 = Date.now();
-  const batchSize = opts.batchSize ?? 20;
+  const batchSize = positiveInteger(opts.batchSize ?? 20, 'batchSize', 200);
+  if (opts.limit !== undefined) positiveInteger(opts.limit, 'limit');
   const errors: string[] = [];
+  const recordError = (message: string): void => {
+    if (errors.length < 200) errors.push(message);
+  };
   const report: PipelineReport = {
     engine: opts.adapter.id,
     extracted: 0,
@@ -148,10 +156,17 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineReport
     errors,
     durationMs: 0,
   };
+  const translationScope = `${opts.from}>${opts.to}`;
+  opts.store.ensureGame(opts.gameId, {
+    dir: opts.gameDir,
+    engineId: opts.adapter.id,
+    translationScope,
+  });
 
   // ── 1. 抽取 ────────────────────────────────────────────────
   const extracted: TextEntry[] = [];
   for await (const e of opts.adapter.extract(opts.gameDir)) {
+    if (opts.signal?.aborted) break;
     extracted.push(e);
     if (opts.limit && extracted.length >= opts.limit) break;
   }
@@ -159,7 +174,11 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineReport
   opts.onProgress?.({ phase: 'extract', current: extracted.length, total: extracted.length });
 
   // ── 1.5 反向 TM 防护 ───────────────────────────────────────
-  const knownTranslations = opts.store.translatedSet(opts.gameId);
+  const knownTranslations = opts.store.translatedSet(
+    opts.gameId,
+    'global',
+    translationScope,
+  );
   const fresh = knownTranslations.size
     ? extracted.filter((e) => !knownTranslations.has(e.source))
     : extracted;
@@ -170,14 +189,27 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineReport
   opts.onProgress?.({ phase: 'store', current: report.upsert.inserted, total: fresh.length });
 
   // ── 3. 取待译（以库为事实来源 → 断点续翻 / 不重复花钱）─────
-  const pending = opts.store.list(opts.gameId, { status: 'pending', limit: opts.limit ?? 1_000_000 });
+  const selected = new Set(extracted.map((e) => `${e.path}\0${e.key}`));
+  const pending = opts.store.list(opts.gameId, { status: 'pending', limit: 1_000_000 })
+    .filter((e) => selected.has(`${e.path}\0${e.key}`));
   report.candidates = pending.length;
 
   // ── 3.5 翻译记忆（TM）：命中的直接复用，不送机翻 ───────────
   let toTranslate = pending;
   if (opts.useTM !== false && pending.length > 0) {
     const tm = new TranslationMemory(opts.store);
-    const { hits } = tm.partition(opts.gameId, pending.map((e) => e.source));
+    const { hits } = tm.partition(
+      opts.gameId,
+      pending.map((e) => e.source),
+      translationScope,
+    );
+    for (const e of pending) {
+      const hit = hits.get(e.source);
+      if (hit && (!controlCodesIntact(e.source, hit.translated, patternFor(opts.adapter.id)) ||
+        missingGlossaryTerms(e.source, hit.translated, normalizeGlossary(opts.glossary)).length > 0)) {
+        hits.delete(e.source);
+      }
+    }
     const cached = pending
       .filter((e) => hits.has(e.source))
       .map((e) => ({
@@ -203,8 +235,9 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineReport
     chunks.push({ start: i, entries: toTranslate.slice(i, i + batchSize) });
   }
 
-  let batchesDone = 0;
+  let processed = 0;
   const tasks = chunks.map(({ start, entries }) => async () => {
+    if (opts.signal?.aborted) return;
     // 掩码：先控制符（__BBn__），再术语（__GTn__）
     const cms = entries.map((e) => mask(e.source, pattern));
     const gms = cms.map((cm) => maskGlossary(cm.masked, glossary));
@@ -220,12 +253,19 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineReport
     report.providerCalls++;
     let results;
     try {
-      results = await opts.provider.translate(reqs);
+      results = await opts.provider.translate(reqs, { signal: opts.signal });
     } catch (err) {
+      if (opts.signal?.aborted) return;
       report.failed += entries.length;
-      errors.push(`批次 @${start} 翻译失败: ${(err as Error).message}`);
+      recordError(`批次 @${start} 翻译失败: ${(err as Error).message}`);
       return;
+    } finally {
+      if (!opts.signal?.aborted) {
+        processed += entries.length;
+        opts.onProgress?.({ phase: 'translate', current: processed, total: toTranslate.length });
+      }
     }
+    if (opts.signal?.aborted) return;
     const byId = new Map(results.map((r) => [r.id, r.translated]));
 
     const updates: Array<{ path: string; key: string; translated: string | null; status?: EntryStatus }> = [];
@@ -235,6 +275,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineReport
       const raw = byId.get(String(start + k));
       if (typeof raw !== 'string' || raw === '') {
         report.failed++;
+        recordError(`${e.path} / ${e.key}: 接口未返回译文`);
         continue;
       }
 
@@ -242,8 +283,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineReport
       const afterGlossary = unmaskGlossary(raw, gms[k].map);
 
       // 硬质检：控制符占位符一个都不能丢
-      const lost = missingPlaceholders(afterGlossary, cms[k].tokens.length, defaultPlaceholder);
-      if (lost.length > 0) {
+      if (!placeholdersIntact(afterGlossary, cms[k].tokens.length) || /__GT\d+__/.test(afterGlossary)) {
         report.conflicts++;
         // 保留机翻原文（含占位符）供人工修，但**不写回游戏**
         updates.push({ path: e.path, key: e.key, translated: raw, status: 'conflict' });
@@ -263,7 +303,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineReport
         report.conflicts++;
         updates.push({ path: e.path, key: e.key, translated: raw, status: 'conflict' });
         for (const h of issues.filter((i) => i.level === 'hard')) {
-          errors.push(`${e.path} 质检硬失败[${h.code}]: ${h.message}`);
+          recordError(`${e.path} 质检硬失败[${h.code}]: ${h.message}`);
         }
         continue;
       }
@@ -276,29 +316,33 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineReport
     }
 
     if (updates.length > 0) opts.store.setTranslations(opts.gameId, updates);
-    batchesDone++;
-    opts.onProgress?.({
-      phase: 'translate',
-      current: Math.min(batchesDone * batchSize, toTranslate.length),
-      total: toTranslate.length,
-    });
   });
 
   await limiter.runAll(tasks);
+  if (opts.signal?.aborted) {
+    report.cancelled = true;
+    report.durationMs = Date.now() - t0;
+    return report;
+  }
 
   // ── 5. 回写（只写 translated / reviewed）───────────────────
   if (opts.repack !== false) {
     const ready = [
       ...opts.store.list(opts.gameId, { status: 'translated', limit: 1_000_000 }),
       ...opts.store.list(opts.gameId, { status: 'reviewed', limit: 1_000_000 }),
-    ];
+    ].filter((e) => selected.has(`${e.path}\0${e.key}`));
     report.repack = await opts.adapter.repack(opts.gameDir, ready);
     if (report.repack.errors.length) errors.push(...report.repack.errors);
     opts.onProgress?.({ phase: 'repack', current: report.repack.written, total: ready.length });
   }
+  if (opts.signal?.aborted) {
+    report.cancelled = true;
+    report.durationMs = Date.now() - t0;
+    return report;
+  }
 
   // ── 6. 字体注入（引擎可选能力）─────────────────────────────
-  if (opts.injectFont && opts.adapter.injectCjkFont) {
+  if (opts.repack !== false && opts.injectFont && opts.adapter.injectCjkFont) {
     try {
       // 拿**真实译文**当样本做字形覆盖校验：确认这台机器上真能显示出来，
       // 而不是配好了字体名结果渲染成豆腐块（"能看"的保证）。
@@ -319,6 +363,11 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineReport
     } catch (err) {
       errors.push(`字体注入失败: ${(err as Error).message}`);
     }
+  }
+  if (opts.signal?.aborted) {
+    report.cancelled = true;
+    report.durationMs = Date.now() - t0;
+    return report;
   }
 
   report.durationMs = Date.now() - t0;

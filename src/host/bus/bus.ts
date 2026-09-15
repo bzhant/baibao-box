@@ -293,9 +293,15 @@ export class BusServer {
    */
   async waitForClient(
     timeoutMs = 10_000,
+    signal?: AbortSignal,
   ): Promise<{ no: number; identity: ClientIdentity }> {
     const deadline = Date.now() + timeoutMs;
     for (;;) {
+      if (signal?.aborted) {
+        throw signal.reason instanceof Error
+          ? signal.reason
+          : new Error('等待客户端连接已取消');
+      }
       const hit = this.clients().find((c) => Object.keys(c.identity).length > 0);
       if (hit) return hit;
       if (Date.now() > deadline) {

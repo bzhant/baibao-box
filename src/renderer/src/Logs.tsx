@@ -86,11 +86,22 @@ export default function Logs(): React.ReactElement {
 
   const color = (lv: string): string =>
     lv === 'error' ? '#e4878d' : lv === 'warn' ? '#e0b45c' : '#8b95a4';
+  const counts = {
+    error: items.filter((r) => r.level === 'error').length,
+    warn: items.filter((r) => r.level === 'warn').length,
+    info: items.filter((r) => r.level === 'info').length,
+  };
 
   return (
     <>
       <div className="card">
         <h3>筛选</h3>
+        <div className="row" style={{ marginBottom: 12 }}>
+          <span className="chip">共 {items.length} 条</span>
+          <span className="chip err">错误 {counts.error}</span>
+          <span className="chip warn">警告 {counts.warn}</span>
+          <span className="chip ok">信息 {counts.info}</span>
+        </div>
         <div className="row">
           <div className="field">
             <label>级别</label>
@@ -130,10 +141,18 @@ export default function Logs(): React.ReactElement {
           </span>
         </h3>
         {items.length === 0 ? (
-          <div className="note">
-            还没有日志。跑一次汉化或选个游戏目录，这里就会出现记录。
-            <br />
-            <span className="muted">打包后的应用没有终端，这个列表就是排查问题的唯一线索。</span>
+          <div className="emptyState">
+            <div>
+              <h4>这里会保留最近的运行轨迹</h4>
+              <p>
+                选一次游戏目录、跑一次汉化，或者点一次接口测试，日志就会开始积累。
+                打包后的应用没有终端，这里就是排查问题时最完整的上下文。
+              </p>
+              <div className="emptyTips">
+                <span className="chip">先去「汉化」页选游戏</span>
+                <span className="chip">或在「配置」页测试接口</span>
+              </div>
+            </div>
           </div>
         ) : (
           <div style={{

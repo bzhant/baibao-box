@@ -1,11 +1,14 @@
 import { createHash } from 'node:crypto';
 import { resolve } from 'node:path';
 import { registry } from '@platform/plugin-registry';
-import { initPlatform, closePlatform, dbPath } from '@platform/init';
+import { acquirePlatform, releasePlatform, dbPath } from '@platform/init';
 import { restoreAll } from '@platform/patch';
 import { runPipeline, type PipelineProgress, type PipelineReport } from '../pipeline/translate-pipeline';
 import { createOpenAICompatibleProvider } from '../translate/providers/openai-compatible';
-import { activeProfile, getProfileKey, listProfiles } from '@platform/config';
+import { activeProfile, getConfig, getProfileKey, listProfiles } from '@platform/config';
+import { isLocalProfile } from '@platform/api-profiles';
+import { language, positiveInteger } from '@shared/validation';
+import { acquireGameLock } from '../host/runtime/game-lock';
 import { logError, logInfo, logWarn } from '@platform/logbus';
 import type {
   TranslationProvider,
@@ -82,17 +85,17 @@ export function pickProvider(profileId?: string): PickedProvider {
     return { provider: stubProvider, autoStub: true, profileName: stubProvider.displayName };
   }
 
-  const wanted = profileId
+  const wanted = profileId && profileId !== 'openai'
     ? listProfiles().find((p) => p.id === profileId) ?? null
     : activeProfile();
   if (!wanted) {
-    logWarn('provider', `指定的方案 "${profileId}" 不存在，回退到本地假机翻`);
-    return { provider: stubProvider, autoStub: true, profileName: stubProvider.displayName };
+    throw new Error(`指定的接口方案 "${profileId}" 不存在`);
   }
 
   // 密钥：界面配置优先，环境变量兜底（老命令行脚本仍能用）
   const key = getProfileKey(wanted.id) || process.env['BAIBAO_OPENAI_API_KEY'] || '';
-  if (!key) {
+  const local = isLocalProfile(wanted);
+  if (!key && !local) {
     logWarn(
       'provider',
       `方案「${wanted.name}」没有配置密钥，回退到本地假机翻（译文形如【中】原文，只用于验证流程）`,
@@ -108,7 +111,7 @@ export function pickProvider(profileId?: string): PickedProvider {
       baseUrl: wanted.baseUrl,
       apiKey: key,
       model: wanted.model,
-      offline: false,
+      offline: local,
     }),
     autoStub: false,
     profileName: wanted.name,
@@ -178,6 +181,16 @@ export function gameIdOf(gameDir: string): string {
   return createHash('sha1').update(resolve(gameDir).toLowerCase(), 'utf8').digest('hex').slice(0, 16);
 }
 
+/** Keep the historical default scope compatible while isolating every other language pair. */
+export function scopedGameIdOf(gameDir: string, from = 'ja', to = 'zh-CN'): string {
+  const base = gameIdOf(gameDir);
+  const source = language(from, '源语言');
+  const target = language(to, '目标语言');
+  if (source === 'ja' && target === 'zh-CN') return base;
+  const scope = createHash('sha1').update(`${source}>${target}`, 'utf8').digest('hex').slice(0, 8);
+  return `${base}-${scope}`;
+}
+
 // ── 引擎探测 ───────────────────────────────────────────────────────────────
 
 export interface DetectOutcome {
@@ -244,6 +257,8 @@ export interface TranslateOptions {
   injectFont?: boolean;
   /** 'openai' | 'stub'；不给则按环境自动选 */
   providerId?: string;
+  /** UI cancellation signal; completed batches remain in the translation memory. */
+  signal?: AbortSignal;
 }
 
 export interface TranslateOutcome {
@@ -270,50 +285,63 @@ export async function runTranslate(
   onProgress?: (p: PipelineProgress) => void,
 ): Promise<TranslateOutcome> {
   const t0 = Date.now();
+  const cfg = getConfig();
   const gameDir = resolve(opts.gameDir);
-  const det = await detectGame(gameDir);
-  if (!det.ok || !det.engineId) throw new Error(det.message ?? '没识别出引擎');
-  if (det.encrypted) {
-    throw new Error('该游戏的数据文件被加密，静态抽取不可用（需运行时提取）。已中止。');
-  }
-  const adapter = registry.getEngine(det.engineId);
-  if (!adapter) throw new Error(`引擎 ${det.engineId} 已识别但没有可用的适配器`);
-
-  logInfo('pipeline', `开始汉化：${gameDir}（${det.engineName}，${opts.from ?? 'ja'} → ${opts.to ?? 'zh-CN'}${opts.limit ? `，试译 ${opts.limit} 条` : ''}）`);
-  const { provider, autoStub } = pickProvider(opts.providerId);
-  const store = initPlatform();
+  const from = language(opts.from ?? cfg.defaultFrom, '源语言');
+  const to = language(opts.to ?? cfg.defaultTo, '目标语言');
+  const limit = opts.limit === undefined ? undefined : positiveInteger(opts.limit, '试译条数');
+  const lock = acquireGameLock(gameDir);
   try {
-    const report = await runPipeline({
-      gameDir,
-      gameId: det.gameId,
-      adapter,
-      provider,
-      store,
-      from: opts.from ?? 'ja',
-      to: opts.to ?? 'zh-CN',
-      limit: opts.limit,
-      repack: opts.repack ?? true,
-      injectFont: opts.injectFont ?? false,
-      onProgress,
-    });
-    logInfo('pipeline',
-      `汉化完成：抽取 ${report.extracted}，入库 ${report.upsert.inserted}，翻译成功 ${report.translated}，` +
-      `冲突 ${report.conflicts}，失败 ${report.failed}` +
-      (report.repack ? `，回写 ${report.repack.written}` : '') +
-      `（${Date.now() - t0}ms）`);
-    if (report.errors.length) logError('pipeline', `有 ${report.errors.length} 条错误：${report.errors[0]}`);
-    return {
-      report,
-      engineId: det.engineId,
-      engineName: det.engineName ?? det.engineId,
-      providerName: provider.displayName,
-      gameId: det.gameId,
-      dbPath: dbPath(),
-      autoStub,
-      durationMs: Date.now() - t0,
-    };
+    const det = await detectGame(gameDir);
+    if (!det.ok || !det.engineId) throw new Error(det.message ?? '没识别出引擎');
+    if (det.encrypted) {
+      throw new Error('该游戏的数据文件被加密，静态抽取不可用（需运行时提取）。已中止。');
+    }
+    const adapter = registry.getEngine(det.engineId);
+    if (!adapter) throw new Error(`引擎 ${det.engineId} 已识别但没有可用的适配器`);
+
+    logInfo('pipeline', `开始汉化：${gameDir}（${det.engineName}，${from} → ${to}${limit ? `，试译 ${limit} 条` : ''}）`);
+    const { provider, autoStub } = pickProvider(opts.providerId);
+    const store = acquirePlatform();
+    try {
+      const gameId = scopedGameIdOf(gameDir, from, to);
+      const report = await runPipeline({
+        gameDir,
+        gameId,
+        adapter,
+        provider,
+        store,
+        from,
+        to,
+        limit,
+        batchSize: cfg.batchSize,
+        rateLimit: { maxConcurrent: cfg.concurrency },
+        repack: opts.repack ?? true,
+        injectFont: opts.injectFont ?? false,
+        signal: opts.signal,
+        onProgress,
+      });
+      logInfo('pipeline',
+        `汉化完成：抽取 ${report.extracted}，入库 ${report.upsert.inserted}，翻译成功 ${report.translated}，` +
+        `冲突 ${report.conflicts}，失败 ${report.failed}` +
+        (report.repack ? `，回写 ${report.repack.written}` : '') +
+        `（${Date.now() - t0}ms）`);
+      if (report.errors.length) logError('pipeline', `有 ${report.errors.length} 条错误：${report.errors[0]}`);
+      return {
+        report,
+        engineId: det.engineId,
+        engineName: det.engineName ?? det.engineId,
+        providerName: provider.displayName,
+        gameId,
+        dbPath: dbPath(),
+        autoStub,
+        durationMs: Date.now() - t0,
+      };
+    } finally {
+      releasePlatform();
+    }
   } finally {
-    closePlatform();
+    lock.release();
   }
 }
 
@@ -336,16 +364,22 @@ export interface RestoreOutcome {
  * 回到翻译前的状态。这是"可逆"这条红线的兑现点，所以要能被 UI 直接调到。
  */
 export async function restoreGame(gameDir: string): Promise<RestoreOutcome> {
-  const r = await restoreAll(resolve(gameDir));
-  logInfo('restore', r.patches === 0
-    ? `还原：没有需要还原的改动（${gameDir}）`
-    : `还原完成：展开 ${r.patches} 个补丁，还原 ${r.restored} 个文件${r.errors.length ? `（${r.errors.length} 个错误）` : ''}`);
-  return {
-    patches: r.patches,
-    restored: r.restored,
-    errors: r.errors,
-    nothingToDo: r.patches === 0,
-  };
+  const dir = resolve(gameDir);
+  const lock = acquireGameLock(dir);
+  try {
+    const r = await restoreAll(dir);
+    logInfo('restore', r.patches === 0
+      ? `还原：没有需要还原的改动（${gameDir}）`
+      : `还原完成：展开 ${r.patches} 个补丁，还原 ${r.restored} 个文件${r.errors.length ? `（${r.errors.length} 个错误）` : ''}`);
+    return {
+      patches: r.patches,
+      restored: r.restored,
+      errors: r.errors,
+      nothingToDo: r.patches === 0,
+    };
+  } finally {
+    lock.release();
+  }
 }
 
 // ── 只回写（把工作台里改好的译文落到游戏文件）───────────────────────────────
@@ -382,22 +416,26 @@ export interface RepackPreview {
 }
 
 /** 回写前的预览：先看清要写什么，再决定写不写。 */
-export async function previewRepack(gameDir: string): Promise<RepackPreview> {
+export async function previewRepack(
+  gameDir: string,
+  scope: { from?: string; to?: string } = {},
+): Promise<RepackPreview> {
   const dir = resolve(gameDir);
   const det = await detectGame(dir);
   if (!det.ok || !det.engineId) throw new Error(det.message ?? '没识别出引擎');
   const adapter = registry.getEngine(det.engineId);
   if (!adapter) throw new Error(`引擎 ${det.engineId} 已识别但没有可用的适配器`);
 
-  const store = initPlatform();
+  const store = acquirePlatform();
   try {
-    const stats = store.stats(det.gameId);
+    const gameId = scopedGameIdOf(dir, scope.from, scope.to);
+    const stats = store.stats(gameId);
     const ready = [
-      ...store.list(det.gameId, { status: 'translated', limit: 1_000_000 }),
-      ...store.list(det.gameId, { status: 'reviewed', limit: 1_000_000 }),
+      ...store.list(gameId, { status: 'translated', limit: 1_000_000 }),
+      ...store.list(gameId, { status: 'reviewed', limit: 1_000_000 }),
     ];
     return {
-      gameId: det.gameId,
+      gameId,
       engineId: det.engineId,
       engineName: det.engineName ?? det.engineId,
       supported: adapter.capabilities?.repack !== false,
@@ -418,7 +456,7 @@ export async function previewRepack(gameDir: string): Promise<RepackPreview> {
       })),
     };
   } finally {
-    closePlatform();
+    releasePlatform();
   }
 }
 
@@ -440,39 +478,46 @@ export interface RepackOnlyOutcome {
 export async function repackGame(
   gameDir: string,
   onProgress?: (p: PipelineProgress) => void,
+  scope: { from?: string; to?: string } = {},
 ): Promise<RepackOnlyOutcome> {
   const t0 = Date.now();
   const dir = resolve(gameDir);
-  const det = await detectGame(dir);
-  if (!det.ok || !det.engineId) throw new Error(det.message ?? '没识别出引擎');
-  if (det.encrypted) {
-    throw new Error('该游戏的数据文件被加密，静态回写不可用。已中止。');
-  }
-  const adapter = registry.getEngine(det.engineId);
-  if (!adapter) throw new Error(`引擎 ${det.engineId} 已识别但没有可用的适配器`);
-
-  const store = initPlatform();
+  const lock = acquireGameLock(dir);
   try {
-    const ready = [
-      ...store.list(det.gameId, { status: 'translated', limit: 1_000_000 }),
-      ...store.list(det.gameId, { status: 'reviewed', limit: 1_000_000 }),
-    ];
-    onProgress?.({ phase: 'repack', current: 0, total: ready.length, message: '正在回写…' });
-    logInfo('repack', `只回写：准备写入 ${ready.length} 条（${det.engineName}）`);
-    const repack = await adapter.repack(dir, ready);
-    logInfo('repack', `回写完成：写入 ${repack.written}，无需改动 ${repack.unchanged}，跳过 ${repack.skipped}` +
-      (repack.backupDir ? `，备份 ${repack.backupDir}` : ''));
-    onProgress?.({ phase: 'repack', current: repack.written, total: ready.length });
-    onProgress?.({ phase: 'done', current: 1, total: 1 });
-    return {
-      repack,
-      engineId: det.engineId,
-      engineName: det.engineName ?? det.engineId,
-      gameId: det.gameId,
-      durationMs: Date.now() - t0,
-    };
+    const det = await detectGame(dir);
+    if (!det.ok || !det.engineId) throw new Error(det.message ?? '没识别出引擎');
+    if (det.encrypted) {
+      throw new Error('该游戏的数据文件被加密，静态回写不可用。已中止。');
+    }
+    const adapter = registry.getEngine(det.engineId);
+    if (!adapter) throw new Error(`引擎 ${det.engineId} 已识别但没有可用的适配器`);
+
+    const store = acquirePlatform();
+    try {
+      const gameId = scopedGameIdOf(dir, scope.from, scope.to);
+      const ready = [
+        ...store.list(gameId, { status: 'translated', limit: 1_000_000 }),
+        ...store.list(gameId, { status: 'reviewed', limit: 1_000_000 }),
+      ];
+      onProgress?.({ phase: 'repack', current: 0, total: ready.length, message: '正在回写…' });
+      logInfo('repack', `只回写：准备写入 ${ready.length} 条（${det.engineName}）`);
+      const repack = await adapter.repack(dir, ready);
+      logInfo('repack', `回写完成：写入 ${repack.written}，无需改动 ${repack.unchanged}，跳过 ${repack.skipped}` +
+        (repack.backupDir ? `，备份 ${repack.backupDir}` : ''));
+      onProgress?.({ phase: 'repack', current: repack.written, total: ready.length });
+      onProgress?.({ phase: 'done', current: 1, total: 1 });
+      return {
+        repack,
+        engineId: det.engineId,
+        engineName: det.engineName ?? det.engineId,
+        gameId,
+        durationMs: Date.now() - t0,
+      };
+    } finally {
+      releasePlatform();
+    }
   } finally {
-    closePlatform();
+    lock.release();
   }
 }
 

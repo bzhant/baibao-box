@@ -2,6 +2,8 @@ import { logWarn } from '@platform/logbus';
 import type { TranslationProvider } from '@shared/contracts';
 import type { TranslationStore } from './translation-store';
 import type { RuntimeTextItem, RuntimeTranslation, RuntimeTranslator } from './session';
+import { controlCodesIntact, mask, placeholdersIntact, unmask } from '../../text-kernel/control-codes';
+import { patternFor } from '../../text-kernel/patterns';
 
 /**
  * 把"翻译能力"接到运行时取词上。
@@ -23,6 +25,7 @@ export interface ProviderTranslatorOptions {
   store?: TranslationStore;
   /** 目标语言（默认 zh-CN） */
   to?: string;
+  from?: string;
   /** 单批最多送几条（避免一次请求过大） */
   batchSize?: number;
   /** 每拿到一批译文回调一次（可用于落库/记日志） */
@@ -42,7 +45,7 @@ export interface TranslatorStats {
 
 export function createProviderTranslator(o: ProviderTranslatorOptions): RuntimeTranslator {
   // 原文 → 译文；空串表示"问过了、接口给不出"，只存内存（不落盘：下次可能就翻得出来）
-  const cache = new Map<string, string>();
+  const cache = new Map<string, { dst: string; retryAfter: number }>();
   const stats: TranslatorStats = { localHits: 0, calls: 0, sent: 0, got: 0 };
 
   const translate: RuntimeTranslator = async (items: RuntimeTextItem[], ctx) => {
@@ -50,14 +53,20 @@ export function createProviderTranslator(o: ProviderTranslatorOptions): RuntimeT
     const miss: RuntimeTextItem[] = [];
     for (const it of items) {
       // ① 本地译文库优先（含外部导入的字典）
-      const local = cache.get(it.src) ?? o.store?.get(it.src);
+      const memory = cache.get(it.src);
+      const stored = o.store?.get(it.src);
+      const local = memory?.dst || stored;
       if (local !== undefined) {
         if (local.length > 0) {
-          cache.set(it.src, local);
+          cache.set(it.src, { dst: local, retryAfter: 0 });
           stats.localHits += 1;
           out.push({ src: it.src, dst: local });
           continue;
         }
+      }
+      if (memory && memory.retryAfter > Date.now()) {
+        out.push({ src: it.src, dst: '' });
+        continue;
       }
       miss.push(it);
     }
@@ -65,10 +74,11 @@ export function createProviderTranslator(o: ProviderTranslatorOptions): RuntimeT
     const size = o.batchSize ?? 32;
     for (let i = 0; i < miss.length; i += size) {
       const chunk = miss.slice(i, i + size);
-      const reqs = chunk.map((c, n) => ({
+      const masked = chunk.map((c) => mask(c.src, patternFor('mvmz')));
+      const reqs = chunk.map((_, n) => ({
         id: String(n),
-        source: c.src,
-        from: ctx.from || 'ja',
+        source: masked[n].masked,
+        from: o.from || ctx.from || 'ja',
         to: o.to ?? 'zh-CN',
       }));
 
@@ -85,15 +95,18 @@ export function createProviderTranslator(o: ProviderTranslatorOptions): RuntimeT
       const pairs: Array<{ src: string; dst: string }> = [];
       chunk.forEach((c, n) => {
         const raw = byId.get(String(n));
-        const dst = typeof raw === 'string' ? raw.trim() : '';
-        if (dst.length > 0 && dst !== c.src) {
-          cache.set(c.src, dst);
+        const candidate = typeof raw === 'string' ? raw.trim() : '';
+        const dst = placeholdersIntact(candidate, masked[n].tokens.length)
+          ? unmask(candidate, masked[n].tokens)
+          : '';
+        if (dst.length > 0 && dst !== c.src && controlCodesIntact(c.src, dst, patternFor('mvmz'))) {
+          cache.set(c.src, { dst, retryAfter: 0 });
           o.store?.set(c.src, dst); // ③ 回写译文库，下次直接命中
           pairs.push({ src: c.src, dst });
           stats.got += 1;
           out.push({ src: c.src, dst });
         } else {
-          cache.set(c.src, '');
+          cache.set(c.src, { dst: '', retryAfter: Date.now() + 3_000 });
           out.push({ src: c.src, dst: '' });
         }
       });

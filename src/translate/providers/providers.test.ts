@@ -57,11 +57,29 @@ describe('OpenAI 兼容 Provider', () => {
     expect(body.messages[0].content).toContain('こんにちは');
   });
 
-  it('拆不出时回退原文，不丢条目', async () => {
+  it('拆不出时返回空译文，让流水线保留待译状态', async () => {
     const { fn } = fakeFetch(() => ({ body: { choices: [{ message: { content: '模型胡说八道' } }] } }));
     const p = createOpenAICompatibleProvider({ apiKey: 'k', fetchFn: fn });
     const out = await p.translate(reqs('あ', 'い'));
-    expect(out.map((r) => r.translated)).toEqual(['あ', 'い']);
+    expect(out.map((r) => r.translated)).toEqual(['', '']);
+  });
+
+  it('支持 SSE 流式响应并拼接增量内容', async () => {
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"[0] 你"}}]}\n\n'));
+        controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"好"}}]}\n\n'));
+        controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+        controller.close();
+      },
+    });
+    const fetchFn = (async () => new Response(stream, {
+      headers: { 'content-type': 'text/event-stream' },
+    })) as typeof fetch;
+    const p = createOpenAICompatibleProvider({ apiKey: 'k', fetchFn });
+    const out = await p.translate(reqs('こんにちは'));
+    expect(out[0].translated).toBe('你好');
   });
 
   it('云端缺密钥报错；本地（offline）免密钥', async () => {
@@ -80,6 +98,14 @@ describe('OpenAI 兼容 Provider', () => {
     const { fn } = fakeFetch(() => ({ status: 429, text: 'rate limited' }));
     const p = createOpenAICompatibleProvider({ apiKey: 'k', fetchFn: fn });
     await expect(p.translate(reqs('a'))).rejects.toThrow(/429/);
+  });
+
+  it('超时会中止请求，不会无限等待', async () => {
+    const fetchFn = ((_input: unknown, init?: RequestInit) => new Promise((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true });
+    })) as typeof fetch;
+    const p = createOpenAICompatibleProvider({ apiKey: 'k', fetchFn, timeoutMs: 5 });
+    await expect(p.translate(reqs('a'))).rejects.toThrow(/超时/);
   });
 });
 

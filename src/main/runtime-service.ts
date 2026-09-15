@@ -1,7 +1,8 @@
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { logError, logInfo, logWarn } from '@platform/logbus';
 import type { TranslationProvider } from '@shared/contracts';
+import { language } from '@shared/validation';
 import {
   acquireGameLock,
   cachePathFor,
@@ -51,10 +52,15 @@ export interface RuntimeStartOptions {
   providerName: string;
   /** 是不是降级成了"本地假机翻"（调用方告知，用于给用户提示） */
   autoStub?: boolean;
+  from?: string;
+  to?: string;
+  batchSize?: number;
 }
 
 export interface RuntimeStatusSnapshot {
   running: boolean;
+  starting?: boolean;
+  stopping?: boolean;
   gameDir?: string;
   engine?: string;
   providerName?: string;
@@ -72,6 +78,7 @@ export interface RuntimeStatusSnapshot {
   apiCalls?: number;
   apiSent?: number;
   apiGot?: number;
+  cleanupError?: string;
 }
 
 export class RuntimeError extends Error {}
@@ -86,17 +93,31 @@ let current: {
   providerName: string;
   bridgeLog: string;
   stopping: boolean;
+  cleanupError: string;
   /** 游戏目录锁（跨进程）：防止界面与命令行同时对同一个游戏动手 */
   lock: GameLock;
+} | null = null;
+
+let starting: {
+  gameDir: string;
+  engine: string;
+  providerName: string;
+  bridgeLog: string;
+  controller: AbortController;
+  done: Promise<void>;
+  finish: () => void;
+  cleanupError: string;
 } | null = null;
 
 /** 「收尾完成」的信号（CLI 等它；界面不用等，靠轮询 status）。 */
 let stopResolve: (() => void) | null = null;
 let stopped: Promise<void> = Promise.resolve();
+let stopInFlight: Promise<void> | null = null;
 /** 最近一次收尾后的统计（收尾时 current 已清空，所以单独存一份给界面/命令行看结果）。 */
 let lastSummary: RuntimeStatusSnapshot | null = null;
 
-export function whenRuntimeStopped(): Promise<void> {
+export async function whenRuntimeStopped(): Promise<void> {
+  if (starting) await starting.done;
   return stopped;
 }
 
@@ -106,11 +127,24 @@ export function lastRuntimeSummary(): RuntimeStatusSnapshot | null {
 
 /** 当前运行时会话的状态（界面用它渲染"正在汉化…"）。 */
 export function runtimeStatus(): RuntimeStatusSnapshot {
+  if (starting) {
+    return {
+      running: true,
+      starting: true,
+      stopping: starting.controller.signal.aborted,
+      gameDir: starting.gameDir,
+      engine: starting.engine,
+      providerName: starting.providerName,
+      bridgeLog: starting.bridgeLog,
+      cleanupError: starting.cleanupError || undefined,
+    };
+  }
   if (!current) return { running: false };
   const st = current.handle.session.stats();
   const ts = translatorStats(current.translator);
   return {
     running: true,
+    stopping: current.stopping,
     gameDir: current.gameDir,
     engine: current.engine,
     providerName: current.providerName,
@@ -123,6 +157,7 @@ export function runtimeStatus(): RuntimeStatusSnapshot {
     apiCalls: ts?.calls ?? 0,
     apiSent: ts?.sent ?? 0,
     apiGot: ts?.got ?? 0,
+    cleanupError: current.cleanupError || undefined,
   };
 }
 
@@ -143,10 +178,12 @@ export interface RuntimeStartResult {
  * 收尾有两条路：用户关掉游戏（自动收尾）或调用 `stopRuntime()`（强杀 + 还原）。
  */
 export async function startRuntime(o: RuntimeStartOptions): Promise<RuntimeStartResult> {
-  if (current) {
-    throw new RuntimeError(`已经有一个运行时汉化在进行中：${current.gameDir}`);
+  if (current || starting) {
+    throw new RuntimeError(`已经有一个运行时汉化在进行中：${current?.gameDir ?? starting?.gameDir}`);
   }
-  const gameDir = o.gameDir;
+  const gameDir = resolve(o.gameDir);
+  const sourceLanguage = language(o.from ?? 'ja', '源语言');
+  const targetLanguage = language(o.to ?? 'zh-CN', '目标语言');
 
   // ★ 先用**跨进程锁**把游戏目录占住，再动它的文件。
   //   默认不等待（用户又点一次按钮应当立刻被告知"已经在汉化中"）；
@@ -170,8 +207,11 @@ export async function startRuntime(o: RuntimeStartOptions): Promise<RuntimeStart
   }
 
   // ① 译文库：本地缓存 + 游戏目录里已有的外部字典（有就直接用，瞬时且免费）
-  const store = new TranslationStore(cachePathFor(gameDir));
-  const seeded = store.load(gameDir);
+  const store = new TranslationStore(cachePathFor(gameDir, sourceLanguage, targetLanguage));
+  const seeded = store.load(
+    gameDir,
+    sourceLanguage === 'ja' && targetLanguage === 'zh-CN' ? undefined : [],
+  );
 
   // ② 翻译接口由调用方给（界面里配的 API / 命令行指定 / 测试注入的确定性实现）
   const provider = o.provider;
@@ -179,9 +219,31 @@ export async function startRuntime(o: RuntimeStartOptions): Promise<RuntimeStart
     logWarn('runtime', '没有可用的翻译接口密钥 —— 用本地假机翻（译文形如【中】原文），只用于跑通流程');
   }
 
-  const translator = createProviderTranslator({ provider, store, to: 'zh-CN' });
+  const translator = createProviderTranslator({
+    provider,
+    store,
+    from: sourceLanguage,
+    to: targetLanguage,
+    batchSize: o.batchSize,
+  });
   const bridgeLog = join(tmpdir(), `bb-bridge-${Date.now()}.log`);
   const activator = createMvmzActivator({ gameDir, bridgePath, bridgeLogPath: bridgeLog });
+  const controller = new AbortController();
+  let finishStarting = (): void => undefined;
+  const done = new Promise<void>((resolveDone) => {
+    finishStarting = resolveDone;
+  });
+  const startState = {
+    gameDir,
+    engine: layout.engine,
+    providerName: o.providerName,
+    bridgeLog,
+    controller,
+    done,
+    finish: finishStarting,
+    cleanupError: '',
+  };
+  starting = startState;
 
   logInfo('runtime', `一键汉化开始：${layout.engine} · ${o.providerName} · ${gameDir}`);
 
@@ -193,98 +255,160 @@ export async function startRuntime(o: RuntimeStartOptions): Promise<RuntimeStart
       stateDir: tmpdir(),
       // 真实游戏启动到就绪可能 40 秒以上（见 tools/mv-runtime/README 坑 2）
       clientTimeoutMs: 180_000,
+      signal: controller.signal,
     });
   } catch (e) {
     // 起不来也要把现场收干净（插件可能已经装进去了）
-    await activator.deactivate().catch(() => undefined);
-    store.flush();
-    lock.release();
-    throw e;
+    let cleanupError = '';
+    try {
+      if (activator.install) await activator.deactivate();
+    } catch (restoreError) {
+      cleanupError = (restoreError as Error).message;
+      startState.cleanupError = cleanupError;
+    }
+    try {
+      store.flush();
+    } catch (flushError) {
+      logWarn('runtime', `译文库保存失败：${(flushError as Error).message}`);
+    }
+    try {
+      lock.release();
+    } catch {
+      /* 尽力而为 */
+    }
+    if (starting === startState) starting = null;
+    startState.finish();
+    throw new RuntimeError(
+      `${(e as Error).message}` +
+      (cleanupError ? `；并且自动还原失败：${cleanupError}` : ''),
+    );
   }
 
-  current = {
-    handle,
-    activator,
-    store,
-    translator,
-    gameDir,
-    engine: layout.engine,
-    providerName: o.providerName,
-    bridgeLog,
-    stopping: false,
-    lock,
-  };
-  stopped = new Promise<void>((res) => {
-    stopResolve = res;
-  });
+  try {
+    current = {
+      handle,
+      activator,
+      store,
+      translator,
+      gameDir,
+      engine: layout.engine,
+      providerName: o.providerName,
+      bridgeLog,
+      stopping: false,
+      cleanupError: '',
+      lock,
+    };
+    stopped = new Promise<void>((res) => {
+      stopResolve = res;
+    });
 
-  // 用户关掉游戏 → 自动收尾（还原游戏文件）
-  void activator.whenExited().then(() => {
-    void stopRuntime().catch((e) => logError('runtime', `自动收尾失败：${(e as Error).message}`));
-  });
+    // 用户关掉游戏 → 自动收尾（还原游戏文件）
+    void activator.whenExited().then(() => {
+      void stopRuntime().catch((e) => logError('runtime', `自动收尾失败：${(e as Error).message}`));
+    });
 
-  return {
-    gameDir,
-    engine: layout.engine,
-    providerName: o.providerName,
-    autoStub: o.autoStub ?? false,
-    bridgeLog,
-    storeSize: store.size,
-    seeded: seeded.seeded,
-  };
+    return {
+      gameDir,
+      engine: layout.engine,
+      providerName: o.providerName,
+      autoStub: o.autoStub ?? false,
+      bridgeLog,
+      storeSize: store.size,
+      seeded: seeded.seeded,
+    };
+  } finally {
+    if (starting === startState) starting = null;
+    startState.finish();
+  }
 }
 
 /** 收尾：结束游戏进程 + **逐字节还原**游戏文件 + 保存译文库。 */
 export async function stopRuntime(): Promise<void> {
+  const pending = starting;
+  if (pending) {
+    pending.controller.abort(new RuntimeError('运行时启动已取消'));
+    await pending.done;
+    if (pending.cleanupError) {
+      throw new RuntimeError(`游戏文件还原失败：${pending.cleanupError}`);
+    }
+    if (current) await stopRuntime();
+    return;
+  }
+
+  if (stopInFlight) return stopInFlight;
   const c = current;
-  if (!c || c.stopping) return;
-  c.stopping = true;
-  current = null;
-
-  // 先把统计快照留下来 —— current 一清空，界面/命令行就看不到过程数据了
-  const st = c.handle.session.stats();
-  const ts = translatorStats(c.translator);
-  lastSummary = {
-    running: false,
-    gameDir: c.gameDir,
-    engine: c.engine,
-    providerName: c.providerName,
-    bridgeLog: c.bridgeLog,
-    storeSize: c.store.size,
-    requested: st.requested,
-    batches: st.batches,
-    translated: st.translated,
-    localHits: ts?.localHits ?? 0,
-    apiCalls: ts?.calls ?? 0,
-    apiSent: ts?.sent ?? 0,
-    apiGot: ts?.got ?? 0,
-  };
-
-  try {
-    c.store.flush();
-  } catch (e) {
-    logWarn('runtime', `译文库保存失败：${(e as Error).message}`);
+  if (!c) return;
+  if (!stopResolve) {
+    stopped = new Promise<void>((res) => {
+      stopResolve = res;
+    });
   }
-  try {
-    await c.activator.deactivate(); // 内部会结束游戏进程，然后按哈希校验还原
-  } catch (e) {
-    logError('runtime', `还原游戏文件失败：${(e as Error).message}`);
-  }
-  try {
-    await c.handle.session.close();
-  } catch {
-    /* 尽力而为 */
-  }
-  logInfo('runtime', '一键汉化已收尾：游戏文件已还原');
+  const task = (async (): Promise<void> => {
+    c.stopping = true;
+    c.cleanupError = '';
 
-  try {
-    c.lock.release();
-  } catch {
-    /* 尽力而为 */
-  }
+    // 先把统计快照留下来 —— current 一清空，界面/命令行就看不到过程数据了
+    const st = c.handle.session.stats();
+    const ts = translatorStats(c.translator);
+    lastSummary = {
+      running: false,
+      gameDir: c.gameDir,
+      engine: c.engine,
+      providerName: c.providerName,
+      bridgeLog: c.bridgeLog,
+      storeSize: c.store.size,
+      requested: st.requested,
+      batches: st.batches,
+      translated: st.translated,
+      localHits: ts?.localHits ?? 0,
+      apiCalls: ts?.calls ?? 0,
+      apiSent: ts?.sent ?? 0,
+      apiGot: ts?.got ?? 0,
+    };
 
-  stopResolve?.();
-  stopResolve = null;
+    try {
+      c.store.flush();
+    } catch (e) {
+      logWarn('runtime', `译文库保存失败：${(e as Error).message}`);
+    }
+    let cleanupError = '';
+    try {
+      await c.activator.deactivate(); // 内部会结束游戏进程，然后按哈希校验还原
+    } catch (e) {
+      cleanupError = (e as Error).message;
+      c.cleanupError = cleanupError;
+      lastSummary.cleanupError = cleanupError;
+      logError('runtime', `还原游戏文件失败：${cleanupError}`);
+    }
+    if (cleanupError) {
+      c.stopping = false;
+      stopResolve?.();
+      stopResolve = null;
+      throw new RuntimeError(`游戏文件还原失败：${cleanupError}`);
+    }
+    try {
+      await c.handle.session.close();
+    } catch {
+      /* 尽力而为 */
+    }
+    logInfo('runtime', '一键汉化已收尾：游戏文件已还原');
+
+    try {
+      c.lock.release();
+    } catch {
+      /* 尽力而为 */
+    }
+
+    if (current === c) current = null;
+    stopResolve?.();
+    stopResolve = null;
+  })();
+  stopInFlight = task;
+  try {
+    await task;
+  } finally {
+    if (stopInFlight === task) stopInFlight = null;
+  }
 }
 
 /** 万一进程被强杀，用这个把游戏目录收干净（界面/命令行都能调）。 */
@@ -293,5 +417,5 @@ export function cleanupGameDir(gameDir: string): { restored: boolean; how: strin
 }
 
 export function isRuntimeActive(): boolean {
-  return current !== null;
+  return current !== null || starting !== null;
 }

@@ -64,7 +64,7 @@ type Res<T> = { ok: boolean; data?: T; error?: string };
 
 const api = window.baibao;
 
-export default function Settings(): React.ReactElement {
+export default function Settings({ onChanged }: { onChanged?: () => void }): React.ReactElement {
   const [status, setStatus] = React.useState<Status | null>(null);
   const [draft, setDraft] = React.useState<Cfg | null>(null);
   const [profiles, setProfiles] = React.useState<ProfileView[]>([]);
@@ -74,6 +74,7 @@ export default function Settings(): React.ReactElement {
   const [editId, setEditId] = React.useState('');
   const [pDraft, setPDraft] = React.useState<{ name: string; baseUrl: string; model: string } | null>(null);
   const [key, setKey] = React.useState('');
+  const [showKey, setShowKey] = React.useState(false);
   const [showNew, setShowNew] = React.useState(false);
   /** 地址预设下拉当前选中项（只影响"填地址"这个动作，不落盘） */
   const [presetPick, setPresetPick] = React.useState('');
@@ -115,6 +116,7 @@ export default function Settings(): React.ReactElement {
   const selectProfile = (p: ProfileView): void => {
     setEditId(p.id);
     setPDraft({ name: p.name, baseUrl: p.baseUrl, model: p.model });
+    setPresetPick(p.preset);
     setKey('');
     setTest(null);
     setMsg('');
@@ -131,24 +133,36 @@ export default function Settings(): React.ReactElement {
     }
     flash('已切换当前使用的接口方案。');
     await load();
+    onChanged?.();
   };
 
   const addFromPreset = async (preset: PresetView): Promise<void> => {
+    if (preset.preset === 'custom') {
+      setEditId('__new__');
+      setPDraft({ name: '自定义接口', baseUrl: '', model: '' });
+      setPresetPick('custom');
+      setShowNew(false);
+      setKey('');
+      setTest(null);
+      return;
+    }
     setBusy(true);
     const r = (await api.cfgProfileSave({
       preset: preset.preset,
       name: preset.name,
       baseUrl: preset.baseUrl,
       model: preset.model,
-    })) as Res<unknown>;
+    })) as Res<{ saved: { id: string } }>;
     setBusy(false);
     if (!r.ok) {
       setErr(r.error ?? '新增失败');
       return;
     }
+    if (r.data?.saved.id) await api.cfgProfileActivate(r.data.saved.id);
     setShowNew(false);
     flash(`已新增方案「${preset.name}」——填一把密钥就能用。`);
     await load();
+    onChanged?.();
   };
 
 
@@ -163,6 +177,7 @@ export default function Settings(): React.ReactElement {
     }
     flash('已删除该方案。');
     await load();
+    onChanged?.();
   };
 
   /** 选一个地址预设 → 直接把地址与模型填进去（用户也可自己改） */
@@ -189,20 +204,29 @@ export default function Settings(): React.ReactElement {
 
     // 1) 方案本身（地址/模型/名字）
     const r1 = (await api.cfgProfileSave({
-      id: editing.id,
+      ...(editing.id ? { id: editing.id } : {}),
       preset: presetPick || editing.preset,
       ...pDraft,
-    })) as Res<unknown>;
-    if (!r1.ok) {
+    })) as Res<{ saved: { id: string } }>;
+    if (!r1.ok || !r1.data) {
       setBusy(false);
       setErr(r1.error ?? '保存方案失败');
       return;
+    }
+    const targetId = r1.data.saved.id;
+    if (!editing.id) {
+      const activated = await api.cfgProfileActivate(targetId);
+      if (!activated.ok) {
+        setBusy(false);
+        setErr(activated.error ?? '启用新方案失败');
+        return;
+      }
     }
 
     // 2) 框里有密钥就先存下来（存完再测，测的就是刚填的这把）
     let tail = '';
     if (key.trim()) {
-      const r2 = (await api.cfgSetKey(editing.id, key)) as Res<{ encrypted: boolean }>;
+      const r2 = (await api.cfgSetKey(targetId, key)) as Res<{ encrypted: boolean }>;
       if (!r2.ok) {
         setBusy(false);
         setErr(r2.error ?? '保存密钥失败');
@@ -213,7 +237,7 @@ export default function Settings(): React.ReactElement {
     }
 
     // 3) 真发一句去测
-    const r3 = (await api.cfgProfileTest(editing.id)) as Res<{ ok: boolean; detail: string; ms: number }>;
+    const r3 = (await api.cfgProfileTest(targetId)) as Res<{ ok: boolean; detail: string; ms: number }>;
     setBusy(false);
     if (!r3.ok || !r3.data) {
       setErr(r3.error ?? '测试失败');
@@ -228,6 +252,7 @@ export default function Settings(): React.ReactElement {
       );
     }
     await load();
+    onChanged?.();
   };
 
   const saveKey = async (id: string, clear = false): Promise<void> => {
@@ -242,9 +267,10 @@ export default function Settings(): React.ReactElement {
     }
     if (clear) flash('已清除这套方案的密钥。');
     else if (r.data?.encrypted) flash('已保存密钥（已用系统密钥加密存储）。');
-    else flash('已保存密钥。⚠ 当前系统不支持加密存储，密钥以明文保存在配置文件里。');
+    else flash('已保存密钥。当前系统不支持加密存储，密钥以明文保存在配置文件里。');
     setKey('');
     await load();
+    onChanged?.();
   };
 
 
@@ -263,6 +289,7 @@ export default function Settings(): React.ReactElement {
     }
     flash('已保存。');
     await load();
+    onChanged?.();
   };
 
   if (!status || !draft) {
@@ -274,7 +301,18 @@ export default function Settings(): React.ReactElement {
   }
 
   const set = <K extends keyof Cfg>(k: K, v: Cfg[K]): void => setDraft({ ...draft, [k]: v });
-  const editing = profiles.find((p) => p.id === editId) ?? null;
+  const editing = editId === '__new__'
+    ? {
+        id: '',
+        name: '自定义接口',
+        baseUrl: '',
+        model: '',
+        preset: 'custom',
+        hasKey: false,
+        encrypted: false,
+        isActive: false,
+      }
+    : profiles.find((p) => p.id === editId) ?? null;
   const active = profiles.find((p) => p.isActive) ?? null;
 
   return (
@@ -301,7 +339,7 @@ export default function Settings(): React.ReactElement {
                 selectProfile(p);
               }}
             >
-              {p.isActive ? '● ' : '○ '}
+              {p.isActive ? '当前 · ' : ''}
               {p.name}
               {p.hasKey ? '' : '（未填密钥）'}
             </button>
@@ -334,25 +372,27 @@ export default function Settings(): React.ReactElement {
         {editing && pDraft && (
           <div style={{ marginTop: 14, borderTop: '1px solid #2a323e', paddingTop: 12 }}>
             <div className="row" style={{ gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-              <span className="chip">方案设置：{editing.name}</span>
+              <span className="chip">方案设置：{editing.id ? editing.name : '新建自定义方案'}</span>
               {editing.hasKey ? (
                 editing.encrypted ? (
                   <span className="chip ok">已配置密钥（已加密）</span>
                 ) : (
                   <span className="chip err">密钥为明文存储</span>
                 )
+              ) : /^https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::|\/|$)/i.test(editing.baseUrl) ? (
+                <span className="chip ok">本地接口（可免密钥）</span>
               ) : (
                 <span className="chip warn">未配置密钥</span>
               )}
               {editing.isActive ? <span className="chip on">当前启用</span> : null}
               <div className="spacer" />
-              <button
+              {editing.id && <button
                 className="danger"
                 disabled={busy || profiles.length <= 1}
                 onClick={() => void removeProfile(editing)}
               >
                 删除这套
-              </button>
+              </button>}
             </div>
 
             {/* 地址：先给"常用地址"下拉，再给可自由编辑的输入框 —— 地址是要能改的，不该藏起来 */}
@@ -400,7 +440,7 @@ export default function Settings(): React.ReactElement {
               </div>
             </div>
             <div className="note" style={{ marginTop: 8 }}>
-              地址**只要到版本号为止**（通常以 <span className="mono">/v1</span> 结尾），
+              地址只要到版本号为止（通常以 <span className="mono">/v1</span> 结尾），
               不要带 <span className="mono">/chat/completions</span>。
               国内网络直连 <span className="mono">api.openai.com</span> 通常不通 ——
               用 DeepSeek 或填中转站给你的地址。
@@ -410,7 +450,7 @@ export default function Settings(): React.ReactElement {
               <div className="field" style={{ flex: 1, minWidth: 300 }}>
                 <label>API Key（留空则不修改；保存后界面上读不回来）</label>
                 <input
-                  type="text"
+                  type={showKey ? 'text' : 'password'}
                   value={key}
                   placeholder="sk-..."
                   disabled={busy}
@@ -420,18 +460,20 @@ export default function Settings(): React.ReactElement {
               <button className="primary" disabled={busy} onClick={() => void saveAndTest()}>
                 保存并测试
               </button>
+              <button className="ghost" disabled={busy} onClick={() => setShowKey((v) => !v)}>
+                {showKey ? '隐藏密钥' : '显示密钥'}
+              </button>
               <button className="ghost" disabled={busy || !editing.hasKey} onClick={() => void saveKey(editing.id, true)}>
                 清除密钥
               </button>
             </div>
             <div className="note" style={{ marginTop: 8 }}>
-              「保存并测试」会把上面的地址/模型/方案名和这把密钥一起存下，然后**真发一句
-              こんにちは**去试 —— 不必再分两步点（先保存再测试容易让人误以为"填了没用"）。
-              粘贴密钥时若带上换行/空格，保存时会**自动去掉首尾空白**；中间夹着其它字符会被拒绝。
+              「保存并测试」会保存当前设置，然后发送一句「こんにちは」验证接口。
+              粘贴密钥时若带上换行或空格，保存时会自动去掉首尾空白；中间夹着其它字符会被拒绝。
             </div>
             {test && (
               <div className={test.ok ? 'okbox' : 'errbox'} style={{ marginTop: 10 }}>
-                {test.ok ? '✓ ' : '✗ '}
+                {test.ok ? '通过：' : '失败：'}
                 {test.detail}
                 <span className="muted">（{test.ms} ms）</span>
               </div>
@@ -439,9 +481,9 @@ export default function Settings(): React.ReactElement {
           </div>
         )}
 
-        {status.hasApiKey && !status.secretEncrypted && (
+        {active?.hasKey && !status.secretEncrypted && (
           <div className="warnbox" style={{ marginTop: 12 }}>
-            当前系统的安全存储不可用，密钥以**明文**写在 <span className="mono">config.json</span> 里。
+            当前系统的安全存储不可用，密钥以明文写在 <span className="mono">config.json</span> 里。
             任何能读到该文件的程序都能拿走它 —— 请知悉。
           </div>
         )}
@@ -498,19 +540,19 @@ export default function Settings(): React.ReactElement {
           </div>
         </div>
         <div className="row" style={{ marginTop: 14 }}>
-          <label className="note" style={{ display: 'flex', gap: 7, alignItems: 'center', cursor: 'pointer' }}>
+          <label className="note" style={{ display: 'flex', gap: 7, alignItems: 'center' }}>
             <input
               type="checkbox"
-              checked={draft.backupBeforeRepack}
-              disabled={busy}
-              onChange={(e) => set('backupBeforeRepack', e.target.checked)}
+              checked
+              disabled
+              readOnly
             />
-            回写前自动备份
+            回写前自动备份（强制开启）
           </label>
         </div>
         <div className="note" style={{ marginTop: 6 }}>
           <span className="muted">
-            （关掉就失去了"一键还原"的能力 —— 工程上不建议，出问题时无法回溯。）
+            游戏文件的改动始终可还原，此项不能关闭。
           </span>
         </div>
       </div>
@@ -533,7 +575,7 @@ export default function Settings(): React.ReactElement {
       </div>
 
       {(msg || err) && (
-        <div className="card">
+        <div className="card fullSpan">
           {msg && <div className="okbox">{msg}</div>}
           {err && <div className="errbox">{err}</div>}
         </div>

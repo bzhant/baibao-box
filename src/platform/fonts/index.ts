@@ -1,4 +1,5 @@
 import { promises as fs } from 'node:fs';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { parseFontFile, missingChars, type FontFace } from './ttf';
 
@@ -13,31 +14,55 @@ import { parseFontFile, missingChars, type FontFace } from './ttf';
  * 这里做的就是把它**可验证化**：注入前先确认字体真实存在、且真的收录了要显示的字符。
  */
 
-const WIN_FONT_DIRS = ['C:/Windows/Fonts', 'C:/WINNT/Fonts'];
+const SYSTEM_FONT_DIRS = process.platform === 'win32'
+  ? ['C:/Windows/Fonts', 'C:/WINNT/Fonts']
+  : process.platform === 'darwin'
+    ? ['/System/Library/Fonts', '/Library/Fonts', join(homedir(), 'Library', 'Fonts')]
+    : ['/usr/share/fonts', '/usr/local/share/fonts', join(homedir(), '.local', 'share', 'fonts')];
 
-let cache: FontFace[] | null = null;
+let cache: { key: string; faces: FontFace[] } | null = null;
 
 /** 清缓存（测试用） */
 export function resetFontCache(): void {
   cache = null;
 }
 
-/** 扫描系统字体目录并解析每个 face（结果缓存） */
-export async function loadSystemFonts(dirs: string[] = WIN_FONT_DIRS): Promise<FontFace[]> {
-  if (cache) return cache;
-  const faces: FontFace[] = [];
-  for (const dir of dirs) {
-    let names: string[] = [];
+async function fontFiles(root: string): Promise<string[]> {
+  const files: string[] = [];
+  const pending: Array<{ dir: string; depth: number }> = [{ dir: root, depth: 0 }];
+  while (pending.length > 0) {
+    const current = pending.pop()!;
+    let entries;
     try {
-      names = await fs.readdir(dir);
+      entries = await fs.readdir(current.dir, { withFileTypes: true });
     } catch {
       continue;
     }
-    for (const name of names) {
-      const lower = name.toLowerCase();
-      if (!lower.endsWith('.ttf') && !lower.endsWith('.ttc') && !lower.endsWith('.otf')) continue;
+    for (const entry of entries) {
+      const path = join(current.dir, entry.name);
+      if (entry.isDirectory() && current.depth < 8) {
+        pending.push({ dir: path, depth: current.depth + 1 });
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      const lower = entry.name.toLowerCase();
+      if (lower.endsWith('.ttf') || lower.endsWith('.ttc') || lower.endsWith('.otf')) {
+        files.push(path);
+      }
+    }
+  }
+  return files;
+}
+
+/** 扫描系统字体目录并解析每个 face（结果缓存） */
+export async function loadSystemFonts(dirs: string[] = SYSTEM_FONT_DIRS): Promise<FontFace[]> {
+  const key = dirs.map((d) => join(d)).sort().join('\0');
+  if (cache?.key === key) return cache.faces;
+  const faces: FontFace[] = [];
+  for (const dir of dirs) {
+    for (const path of await fontFiles(dir)) {
       try {
-        const buf = await fs.readFile(join(dir, name));
+        const buf = await fs.readFile(path);
         for (const f of parseFontFile(buf)) {
           if (f.family && f.codepoints.size > 0) faces.push({ ...f, family: f.family });
         }
@@ -46,7 +71,7 @@ export async function loadSystemFonts(dirs: string[] = WIN_FONT_DIRS): Promise<F
       }
     }
   }
-  cache = faces;
+  cache = { key, faces };
   return faces;
 }
 
@@ -75,7 +100,17 @@ export interface CoverageReport {
  * "♥ 能不能显示"会**误报缺字** —— 实测就误报过 `・♡Ⅿ♥`。
  */
 const GENERIC_FALLBACKS: Record<string, readonly string[]> = {
-  'sans-serif': ['Arial', 'Microsoft YaHei UI', 'MS Gothic', 'Segoe UI Symbol'],
+  'sans-serif': [
+    'Arial',
+    'Microsoft YaHei UI',
+    'MS Gothic',
+    'Segoe UI Symbol',
+    'PingFang SC',
+    'Heiti SC',
+    'STHeiti',
+    'Hiragino Sans GB',
+    'Noto Sans CJK SC',
+  ],
   serif: ['Times New Roman', 'SimSun', 'MS Mincho'],
   monospace: ['Consolas', 'Courier New'],
   system: ['Microsoft YaHei UI', 'Segoe UI'],

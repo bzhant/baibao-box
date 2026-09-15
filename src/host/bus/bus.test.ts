@@ -62,6 +62,15 @@ describe('本地 RPC 总线', () => {
     expect(list[0].identity.arch).toBe(64);
   });
 
+  it('等待握手时可立即取消', async () => {
+    server = new BusServer();
+    await server.listen();
+    const controller = new AbortController();
+    const waiting = server.waitForClient(3000, controller.signal);
+    controller.abort(new Error('cancelled'));
+    await expect(waiting).rejects.toThrow('cancelled');
+  });
+
   it('★ 原生 → 宿主 调用：拿回结果', async () => {
     const { server: s, client } = await setup();
     s.handle('translate', (args) => {

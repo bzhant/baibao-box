@@ -73,10 +73,8 @@ npm run dev        # 开发模式起窗（热更新）
 ## 五、提交前自查
 
 ```bash
-npm run typecheck   # 类型检查，必须 0 错误
-npm test            # 单元 + 集成测试，必须全绿
-npm run lint        # 代码检查
-npm run build       # 三进程产物
+npm run check       # 类型检查 + 单元/集成测试 + 三进程构建
+npm run e2e         # Electron 起窗 + SQLite/渲染层冒烟
 ```
 
 - 改了原生侧（`native/`）→ 跑 `cd native && node build.mjs && bash acceptance-all.sh`；

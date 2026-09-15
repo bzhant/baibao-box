@@ -21,9 +21,8 @@ import React from 'react';
  *    原因：修译文最常见的动作是"看一句、改一句、继续看下一句"。
  *    要求用户先点"保存整页"会丢改动；每条独立保存最贴合这个流程。
  *
- * ③ **改原文要明确警告**。原文变了，旧译文就不再对应，
- *    所以改原文会把该条打回"未译"并需要重新翻译 —— 这一点必须写在界面上，
- *    否则用户会发现"我改了原文，译文没了"，以为是 bug。
+ * ③ 原文只读，译文保存前统一校验控制符。原文是重新抽取和失效判断的依据，
+ *    工作台不能伪造；控制符不一致的译文也不能进入回写集合。
  */
 
 interface Entry {
@@ -56,14 +55,24 @@ const STATUS_LABEL: Record<string, string> = {
 
 const api = window.baibao;
 
-export default function Workbench({ gameDir }: { gameDir: string }): React.ReactElement {
+export default function Workbench({
+  gameDir,
+  from,
+  to,
+}: {
+  gameDir: string;
+  from: string;
+  to: string;
+}): React.ReactElement {
   const [page, setPage] = React.useState<Page | null>(null);
   const [status, setStatus] = React.useState<string>('');
   const [pathPrefix, setPathPrefix] = React.useState('');
   const [search, setSearch] = React.useState('');
+  const [offset, setOffset] = React.useState(0);
   const [busy, setBusy] = React.useState(false);
   const [err, setErr] = React.useState('');
   const [info, setInfo] = React.useState('');
+  const loadRequest = React.useRef(0);
 
   const [editing, setEditing] = React.useState<Entry | null>(null);
   const [draft, setDraft] = React.useState('');
@@ -82,37 +91,57 @@ export default function Workbench({ gameDir }: { gameDir: string }): React.React
   // 批量替换
   const [bFind, setBFind] = React.useState('');
   const [bReplace, setBReplace] = React.useState('');
-  const [bField, setBField] = React.useState<'translated' | 'source'>('translated');
   const [bPreview, setBPreview] = React.useState<{
     scanned: number; matched: number; changed: number; dryRun: boolean;
+    rejected: number;
+    previewToken: string;
     samples: Array<{ path: string; key: string; before: string; after: string }>;
   } | null>(null);
 
-  const load = React.useCallback(async (over?: Partial<{ status: string; pathPrefix: string; search: string }>) => {
+  const load = React.useCallback(async (
+    over?: Partial<{ status: string; pathPrefix: string; search: string; offset: number }>,
+  ) => {
     if (!gameDir) return;
+    const request = ++loadRequest.current;
     setBusy(true);
     setErr('');
     const st = over && 'status' in over ? over.status! : status;
     const pp = over && 'pathPrefix' in over ? over.pathPrefix! : pathPrefix;
     const sq = over && 'search' in over ? over.search! : search;
+    const nextOffset = over && 'offset' in over ? over.offset! : offset;
     const r = await api.wbList(gameDir, {
       status: st || undefined,
       pathPrefix: pp || undefined,
       search: sq || undefined,
+      from,
+      to,
       limit: 200,
+      offset: nextOffset,
     }) as Res<Page>;
+    if (request !== loadRequest.current) return;
     setBusy(false);
     if (!r.ok || !r.data) { setErr(r.error ?? '读取失败'); return; }
+    setOffset(r.data.offset);
     setPage(r.data);
-  }, [gameDir, status, pathPrefix, search]);
+  }, [gameDir, status, pathPrefix, search, offset, from, to]);
 
-  React.useEffect(() => { void load(); /* 首次进入自动加载 */ }, [gameDir]); // eslint-disable-line react-hooks/exhaustive-deps
+  React.useEffect(() => {
+    setOffset(0);
+    void load({ offset: 0 });
+  }, [gameDir, from, to]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const save = async (): Promise<void> => {
+  const save = async (reviewed = false): Promise<void> => {
     if (!editing) return;
     setBusy(true);
     setErr('');
-    const r = await api.wbSave(gameDir, editing.path, editing.key, draft, editing.status === 'reviewed' ? 'reviewed' : undefined);
+    const r = await api.wbSave(
+      gameDir,
+      editing.path,
+      editing.key,
+      draft,
+      reviewed || editing.status === 'reviewed' ? 'reviewed' : undefined,
+      { from, to },
+    );
     setBusy(false);
     if (!r.ok) { setErr(r.error ?? '保存失败'); return; }
     setInfo(`已保存：${editing.path} / ${editing.key}`);
@@ -125,8 +154,10 @@ export default function Workbench({ gameDir }: { gameDir: string }): React.React
     setBusy(true);
     setErr('');
     const r = await api.wbBulk(gameDir, {
-      field: bField, find: bFind, replace: bReplace,
+      field: 'translated', find: bFind, replace: bReplace, from, to,
       status: status || undefined, pathPrefix: pathPrefix || undefined, dryRun,
+      expectedMatches: dryRun ? undefined : bPreview?.matched,
+      expectedPreviewToken: dryRun ? undefined : bPreview?.previewToken,
     }) as Res<typeof bPreview>;
     setBusy(false);
     if (!r.ok) { setErr(r.error ?? '批量替换失败'); return; }
@@ -137,9 +168,11 @@ export default function Workbench({ gameDir }: { gameDir: string }): React.React
     if (!dryRun) await load();
   };
 
+  const invalidateBulkPreview = (): void => setBPreview(null);
+
   const previewRepack = async (): Promise<void> => {
     setBusy(true); setErr(''); setRpDone(null);
-    const r = await api.wbRepackPreview(gameDir) as Res<typeof rpPrev>;
+    const r = await api.wbRepackPreview(gameDir, { from, to }) as Res<typeof rpPrev>;
     setBusy(false);
     if (!r.ok) { setErr(r.error ?? '预览失败'); return; }
     setRpPrev(r.data ?? null);
@@ -154,7 +187,7 @@ export default function Workbench({ gameDir }: { gameDir: string }): React.React
     );
     if (!yes) return;
     setBusy(true); setErr('');
-    const r = await api.wbRepack(gameDir) as Res<typeof rpDone>;
+    const r = await api.wbRepack(gameDir, { from, to }) as Res<typeof rpDone>;
     setBusy(false);
     if (!r.ok) { setErr(r.error ?? '回写失败'); return; }
     setRpDone(r.data ?? null);
@@ -167,7 +200,7 @@ export default function Workbench({ gameDir }: { gameDir: string }): React.React
     const p = await api.wbPickExport();
     if (!p.ok || !p.data) return;
     setBusy(true);
-    const r = await api.wbExport(gameDir, p.data) as Res<{ file: string; count: number }>;
+    const r = await api.wbExport(gameDir, p.data, { from, to }) as Res<{ file: string; count: number }>;
     setBusy(false);
     if (!r.ok) { setErr(r.error ?? '导出失败'); return; }
     setInfo(`已导出 ${r.data?.count ?? 0} 条到 ${r.data?.file ?? ''}`);
@@ -177,12 +210,18 @@ export default function Workbench({ gameDir }: { gameDir: string }): React.React
     setErr('');
     const p = await api.wbPickImport();
     if (!p.ok || !p.data) return;
+    if (!window.confirm('导入会覆盖路径和键匹配的已有译文，确定继续吗？')) return;
     setBusy(true);
-    const r = await api.wbImport(gameDir, p.data) as Res<{ read: number; applied: number; skipped: number; missing: number }>;
+    const r = await api.wbImport(gameDir, p.data, { from, to }) as Res<{
+      read: number; applied: number; skipped: number; missing: number; mismatched: number;
+    }>;
     setBusy(false);
     if (!r.ok) { setErr(r.error ?? '导入失败'); return; }
     const d = r.data!;
-    setInfo(`导入：读 ${d.read} 条，应用 ${d.applied} 条，跳过 ${d.skipped} 条，**库里没有 ${d.missing} 条**`);
+    setInfo(
+      `导入：读 ${d.read} 条，应用 ${d.applied} 条，跳过 ${d.skipped} 条，` +
+      `库里没有 ${d.missing} 条，原文已变化 ${d.mismatched} 条`,
+    );
     await load();
   };
 
@@ -192,8 +231,21 @@ export default function Workbench({ gameDir }: { gameDir: string }): React.React
 
   if (!gameDir) {
     return (
-      <div className="card">
-        <div className="note">先在「汉化」页选一个游戏目录，这里才能浏览它的文本。</div>
+      <div className="card fullSpan">
+        <div className="emptyState">
+          <div>
+            <h4>先选一个游戏目录，工作台才有内容可修</h4>
+            <p>
+              工作台只负责浏览、检索和人工修订已经抽取进库的文本。
+              先回到「汉化」页选中游戏，再跑一次抽取或汉化，这里就会出现条目。
+            </p>
+            <div className="emptyTips">
+              <span className="chip">先选游戏</span>
+              <span className="chip">再抽取入库</span>
+              <span className="chip">然后回来修订</span>
+            </div>
+          </div>
+        </div>
       </div>
     );
   }
@@ -274,7 +326,7 @@ export default function Workbench({ gameDir }: { gameDir: string }): React.React
               </div>
             )}
             {rpDone.repack.errors.length > 0 && (
-              <div className="errbox">{rpDone.repack.errors.map((e, i) => <div key={i}>✗ {e}</div>)}</div>
+              <div className="errbox">{rpDone.repack.errors.map((e, i) => <div key={i}>错误：{e}</div>)}</div>
             )}
           </>
         )}
@@ -286,7 +338,12 @@ export default function Workbench({ gameDir }: { gameDir: string }): React.React
         <div className="row">
           <div className="field">
             <label>状态</label>
-            <select value={status} onChange={(e) => { setStatus(e.target.value); void load({ status: e.target.value }); }}>
+            <select value={status} onChange={(e) => {
+              setStatus(e.target.value);
+              setOffset(0);
+              setBPreview(null);
+              void load({ status: e.target.value, offset: 0 });
+            }}>
               <option value="">全部</option>
               <option value="pending">未译</option>
               <option value="translated">已译</option>
@@ -299,14 +356,27 @@ export default function Workbench({ gameDir }: { gameDir: string }): React.React
             <input
               type="text" value={search} placeholder="输入关键词后回车"
               onChange={(e) => setSearch(e.target.value)}
-              onKeyDown={(e) => { if (e.key === 'Enter') void load({ search }); }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  setOffset(0);
+                  void load({ search, offset: 0 });
+                }
+              }}
             />
           </div>
-          <button onClick={() => void load({ search })} disabled={busy}>搜索</button>
+          <button onClick={() => {
+            setOffset(0);
+            void load({ search, offset: 0 });
+          }} disabled={busy}>搜索</button>
           {pathPrefix && (
             <>
               <span className="chip">仅看 {pathPrefix}</span>
-              <button className="ghost" onClick={() => { setPathPrefix(''); void load({ pathPrefix: '' }); }}>清除</button>
+              <button className="ghost" onClick={() => {
+                setPathPrefix('');
+                setOffset(0);
+                setBPreview(null);
+                void load({ pathPrefix: '', offset: 0 });
+              }}>清除</button>
             </>
           )}
         </div>
@@ -318,7 +388,12 @@ export default function Workbench({ gameDir }: { gameDir: string }): React.React
               {page.pathCounts.slice(0, 14).map((p) => (
                 <button
                   key={p.path} className="ghost" style={{ fontSize: 11.5, padding: '4px 10px' }}
-                  onClick={() => { setPathPrefix(p.path); void load({ pathPrefix: p.path }); }}
+                  onClick={() => {
+                    setPathPrefix(p.path);
+                    setOffset(0);
+                    setBPreview(null);
+                    void load({ pathPrefix: p.path, offset: 0 });
+                  }}
                 >{p.path.replace(/^.*[/\\]/, '')} <span className="muted">({p.count})</span></button>
               ))}
             </div>
@@ -330,34 +405,29 @@ export default function Workbench({ gameDir }: { gameDir: string }): React.React
       <div className="card">
         <h3>批量替换</h3>
         <div className="row">
-          <div className="field">
-            <label>在哪个字段里找</label>
-            <select value={bField} onChange={(e) => setBField(e.target.value as 'translated' | 'source')}>
-              <option value="translated">译文</option>
-              <option value="source">原文</option>
-            </select>
-          </div>
           <div className="field"><label>查找</label>
-            <input type="text" value={bFind} onChange={(e) => setBFind(e.target.value)} /></div>
+            <input type="text" value={bFind} onChange={(e) => {
+              setBFind(e.target.value);
+              invalidateBulkPreview();
+            }} /></div>
           <div className="field"><label>替换为</label>
-            <input type="text" value={bReplace} onChange={(e) => setBReplace(e.target.value)} /></div>
+            <input type="text" value={bReplace} onChange={(e) => {
+              setBReplace(e.target.value);
+              invalidateBulkPreview();
+            }} /></div>
           <button onClick={() => void doBulk(true)} disabled={busy || !bFind}>预演</button>
           <button
-            className="danger" disabled={busy || !bFind || !bPreview || bPreview.dryRun === false}
+            className="danger"
+            disabled={busy || !bFind || !bPreview || bPreview.dryRun === false || bPreview.matched === 0}
             onClick={() => void doBulk(false)}
           >确认替换</button>
         </div>
-        {bField === 'source' && (
-          <div className="warnbox">
-            改**原文**会把命中条目的译文清空、状态打回"未译"，需要重新翻译。
-            原文的真正落盘发生在下一次"开始汉化"的抽取/回写阶段。
-          </div>
-        )}
         {bPreview && (
           <>
             <div className="note" style={{ marginTop: 10 }}>
               扫过 {bPreview.scanned} 条，命中 <b>{bPreview.matched}</b> 条
               {bPreview.dryRun ? '（预演，未写入）' : `，已写入 ${bPreview.changed} 条`}
+              {bPreview.rejected > 0 ? `，另有 ${bPreview.rejected} 条因控制符不一致被跳过` : ''}
             </div>
             {bPreview.samples.length > 0 && (
               <table>
@@ -407,10 +477,11 @@ export default function Workbench({ gameDir }: { gameDir: string }): React.React
               />
             </div>
             <div className="row" style={{ marginTop: 10 }}>
-              <button className="primary" onClick={save} disabled={busy}>保存</button>
+              <button className="primary" onClick={() => void save()} disabled={busy}>保存</button>
+              <button onClick={() => void save(true)} disabled={busy}>保存并标记已复核</button>
               <button onClick={() => void (async () => {
                 setDraft('');
-                await api.wbSave(gameDir, editing.path, editing.key, null);
+                await api.wbSave(gameDir, editing.path, editing.key, null, undefined, { from, to });
                 setInfo('已清空该条译文（状态回到未译）');
                 setEditing(null);
                 await load();
@@ -451,6 +522,23 @@ export default function Workbench({ gameDir }: { gameDir: string }): React.React
         {!editing && page && page.entries.length === 0 && (
           <div className="note" style={{ marginTop: 10 }}>
             没有符合条件的条目。如果这个游戏还没跑过汉化，先回「汉化」页跑一次（可以勾掉"回写游戏文件"只抽取入库）。
+          </div>
+        )}
+        {!editing && page && page.total > page.limit && (
+          <div className="row" style={{ marginTop: 14, justifyContent: 'flex-end' }}>
+            <button
+              className="ghost"
+              disabled={busy || page.offset === 0}
+              onClick={() => void load({ offset: Math.max(0, page.offset - page.limit) })}
+            >上一页</button>
+            <span className="note">
+              {page.offset + 1}-{Math.min(page.offset + page.entries.length, page.total)} / {page.total}
+            </span>
+            <button
+              className="ghost"
+              disabled={busy || page.offset + page.limit >= page.total}
+              onClick={() => void load({ offset: page.offset + page.limit })}
+            >下一页</button>
           </div>
         )}
       </div>

@@ -84,6 +84,8 @@ export interface StartSessionOptions {
   stateDir: string;
   /** 等引擎侧握手的时间 */
   clientTimeoutMs?: number;
+  /** 取消启动等待；调用方仍负责让 activator 还原现场。 */
+  signal?: AbortSignal;
 }
 
 export interface RuntimeHandle {
@@ -108,6 +110,11 @@ export async function startRuntimeSessionWith(o: StartSessionOptions): Promise<R
 
   let activation: RuntimeActivation;
   try {
+    if (o.signal?.aborted) {
+      throw o.signal.reason instanceof Error
+        ? o.signal.reason
+        : new Error('运行时启动已取消');
+    }
     activation = await o.activator.activate({ port: info.port, uri: info.uri });
   } catch (e) {
     await session.close();
@@ -115,7 +122,7 @@ export async function startRuntimeSessionWith(o: StartSessionOptions): Promise<R
   }
 
   try {
-    await session.waitForClient(o.clientTimeoutMs ?? 20_000);
+    await session.waitForClient(o.clientTimeoutMs ?? 20_000, o.signal);
   } catch (e) {
     await session.close();
     throw new Error(

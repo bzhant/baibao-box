@@ -1,10 +1,11 @@
-import { BrowserWindow, dialog, ipcMain, shell } from 'electron';
+import { BrowserWindow, dialog, ipcMain, shell, type IpcMainInvokeEvent } from 'electron';
 import { existsSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { registerBuiltinPlugins } from './bootstrap-plugins';
 import { registry } from '@platform/plugin-registry';
 import {
   activateProfile,
+  getConfig,
   configStatus,
   deleteProfileById,
   hasApiKey as hasApiKeyCfg,
@@ -25,6 +26,7 @@ import {
 } from './translate-service';
 import type { PipelineProgress } from '../pipeline/translate-pipeline';
 import {
+  isRuntimeActive,
   lastRuntimeSummary,
   runtimeStatus,
   startRuntime,
@@ -42,6 +44,7 @@ import {
   exportEntries,
   importEntries,
   type WorkbenchQuery,
+  type WorkbenchScope,
   type BulkReplaceOptions,
 } from './workbench-service';
 
@@ -62,6 +65,7 @@ export const IPC = {
   pickGameDir: 'bb:pick-game-dir',
   detect: 'bb:detect',
   translate: 'bb:translate',
+  translateCancel: 'bb:translate-cancel',
   restore: 'bb:restore',
   reveal: 'bb:reveal',
   env: 'bb:env',
@@ -81,6 +85,12 @@ export const IPC = {
   runtimeStart: 'bb:runtime-start',
   runtimeStop: 'bb:runtime-stop',
   runtimeStatus: 'bb:runtime-status',
+  floatingOpen: 'bb:floating-open',
+  floatingClose: 'bb:floating-close',
+  floatingStatus: 'bb:floating-status',
+  floatingSetExpanded: 'bb:floating-set-expanded',
+  floatingSetPosition: 'bb:floating-set-position',
+  showMainWindow: 'bb:show-main-window',
   // ── 人工修订工作台（工作台能力）──
   wbList: 'bb:wb-list',
   wbSave: 'bb:wb-save',
@@ -109,19 +119,44 @@ function err(e: unknown): IpcErr {
 }
 
 /** 会话级状态：同一时刻只允许一个翻译任务（避免两个任务同时回写同一游戏） */
-let running: { gameDir: string; startedAt: number } | null = null;
+let running: { gameDir: string; startedAt: number; controller: AbortController } | null = null;
 
 export function isTranslating(): boolean {
   return running !== null;
 }
 
-export function registerIpc(getWindow: () => BrowserWindow | null): void {
+interface WindowControls {
+  getWindows(): BrowserWindow[];
+  showMainWindow(): BrowserWindow;
+  openFloatingWindow(): BrowserWindow;
+  closeFloatingWindow(): boolean;
+  isFloatingOpen(): boolean;
+  isFloatingExpanded(): boolean;
+  setFloatingExpanded(expanded: boolean): boolean;
+  setFloatingPosition(x: number, y: number): boolean;
+}
+
+function senderWindow(event: IpcMainInvokeEvent): BrowserWindow | null {
+  return BrowserWindow.fromWebContents(event.sender);
+}
+
+function sendToWindows(
+  windows: () => BrowserWindow[],
+  channel: string,
+  payload: unknown,
+): void {
+  for (const win of windows()) win.webContents.send(channel, payload);
+}
+
+export function registerIpc(getWindow: () => BrowserWindow | null, windows: WindowControls): void {
   registerBuiltinPlugins(); // 幂等
+  const approvedExports = new Set<string>();
+  const approvedImports = new Set<string>();
 
   // ── 选目录：用系统原生对话框，而不是让用户手打路径 ──
-  ipcMain.handle(IPC.pickGameDir, async (): Promise<IpcResult<string | null>> => {
+  ipcMain.handle(IPC.pickGameDir, async (event): Promise<IpcResult<string | null>> => {
     try {
-      const win = getWindow();
+      const win = senderWindow(event) ?? getWindow();
       const r = win
         ? await dialog.showOpenDialog(win, {
             title: '选择游戏根目录（含 data/ 或 www/ 的那一层）',
@@ -155,22 +190,23 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
       if (running) {
         return err(`已有任务在执行（${running.gameDir}）。请等它结束，或先还原。`);
       }
+      if (isRuntimeActive()) return err('运行时汉化正在进行，请先结束游戏会话。');
       const gameDir = resolve(opts.gameDir);
-      const win = getWindow();
-      running = { gameDir, startedAt: Date.now() };
+      const controller = new AbortController();
+      running = { gameDir, startedAt: Date.now(), controller };
 
       // 不 await：让 invoke 立刻返回，渲染层马上能进"进行中"状态并收到进度
       void (async () => {
         try {
           const out = await runTranslate(
-            { ...opts, gameDir },
+            { ...opts, gameDir, signal: controller.signal },
             (p: PipelineProgress) => {
-              win?.webContents.send(IPC.progress, p);
+              sendToWindows(windows.getWindows, IPC.progress, p);
             },
           );
-          win?.webContents.send(IPC.finished, { ok: true, data: out });
+          sendToWindows(windows.getWindows, IPC.finished, { ok: true, data: out });
         } catch (e) {
-          win?.webContents.send(IPC.finished, err(e));
+          sendToWindows(windows.getWindows, IPC.finished, err(e));
         } finally {
           running = null;
         }
@@ -182,11 +218,18 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
     }
   });
 
+  ipcMain.handle(IPC.translateCancel, async (): Promise<IpcResult<{ cancelled: boolean }>> => {
+    if (!running) return ok({ cancelled: false });
+    running.controller.abort(new Error('用户取消'));
+    return ok({ cancelled: true });
+  });
+
   // ── 一键还原（工程红线：可逆）──
   ipcMain.handle(IPC.restore, async (_e, gameDir: unknown): Promise<IpcResult<Awaited<ReturnType<typeof restoreGame>>>> => {
     try {
       if (typeof gameDir !== 'string' || !gameDir.trim()) return err('游戏目录为空');
       if (running) return err('正在翻译中，请等它结束后再还原。');
+      if (isRuntimeActive()) return err('运行时汉化正在进行，请先结束游戏会话。');
       return ok(await restoreGame(gameDir));
     } catch (e) {
       return err(e);
@@ -328,13 +371,15 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
     }
   });
 
-  ipcMain.handle(IPC.wbSave, async (_e, gameDir: unknown, path: unknown, key: unknown, translated: unknown, status: unknown): Promise<IpcResult<{ changed: boolean }>> => {
+  ipcMain.handle(IPC.wbSave, async (
+    _e, gameDir: unknown, path: unknown, key: unknown, translated: unknown, status: unknown, scope: unknown,
+  ): Promise<IpcResult<{ changed: boolean }>> => {
     try {
       if (typeof gameDir !== 'string' || !gameDir.trim()) return err('游戏目录为空');
       if (typeof path !== 'string' || typeof key !== 'string' || !path || !key) return err('定位信息不完整');
       if (running) return err('正在翻译中，请等它结束后再编辑。');
       const t = translated === null || translated === undefined ? null : String(translated);
-      return ok(await saveEntry(gameDir, path, key, t, status as never));
+      return ok(await saveEntry(gameDir, path, key, t, status as never, (scope ?? {}) as WorkbenchScope));
     } catch (e) {
       return err(e);
     }
@@ -350,72 +395,93 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
     }
   });
 
-  ipcMain.handle(IPC.wbPickExport, async (): Promise<IpcResult<string | null>> => {
+  ipcMain.handle(IPC.wbPickExport, async (event): Promise<IpcResult<string | null>> => {
     try {
-      const win = getWindow();
+      const win = senderWindow(event) ?? getWindow();
       const r = win
         ? await dialog.showSaveDialog(win, {
             title: '导出译文包', defaultPath: 'baibao-export.json',
             filters: [{ name: 'JSON', extensions: ['json'] }],
           })
         : await dialog.showSaveDialog({ defaultPath: 'baibao-export.json' });
-      return ok(r.canceled || !r.filePath ? null : r.filePath);
+      if (r.canceled || !r.filePath) return ok(null);
+      const file = resolve(r.filePath);
+      approvedExports.add(file);
+      return ok(file);
     } catch (e) {
       return err(e);
     }
   });
 
-  ipcMain.handle(IPC.wbExport, async (_e, gameDir: unknown, outFile: unknown): Promise<IpcResult<Awaited<ReturnType<typeof exportEntries>>>> => {
+  ipcMain.handle(IPC.wbExport, async (
+    _e, gameDir: unknown, outFile: unknown, scope: unknown,
+  ): Promise<IpcResult<Awaited<ReturnType<typeof exportEntries>>>> => {
     try {
       if (typeof gameDir !== 'string' || !gameDir.trim()) return err('游戏目录为空');
       if (typeof outFile !== 'string' || !outFile.trim()) return err('导出路径为空');
-      return ok(await exportEntries(gameDir, outFile));
+      const file = resolve(outFile);
+      if (!approvedExports.delete(file)) return err('导出路径未经文件选择器确认');
+      return ok(await exportEntries(gameDir, file, (scope ?? {}) as WorkbenchScope));
     } catch (e) {
       return err(e);
     }
   });
 
-  ipcMain.handle(IPC.wbPickImport, async (): Promise<IpcResult<string | null>> => {
+  ipcMain.handle(IPC.wbPickImport, async (event): Promise<IpcResult<string | null>> => {
     try {
-      const win = getWindow();
+      const win = senderWindow(event) ?? getWindow();
       const r = win
         ? await dialog.showOpenDialog(win, {
             title: '选择译文包', properties: ['openFile'],
             filters: [{ name: 'JSON', extensions: ['json'] }],
           })
         : await dialog.showOpenDialog({ properties: ['openFile'] });
-      return ok(r.canceled || !r.filePaths[0] ? null : r.filePaths[0]);
+      if (r.canceled || !r.filePaths[0]) return ok(null);
+      const file = resolve(r.filePaths[0]);
+      approvedImports.add(file);
+      return ok(file);
     } catch (e) {
       return err(e);
     }
   });
 
-  ipcMain.handle(IPC.wbImport, async (_e, gameDir: unknown, inFile: unknown): Promise<IpcResult<Awaited<ReturnType<typeof importEntries>>>> => {
+  ipcMain.handle(IPC.wbImport, async (
+    _e, gameDir: unknown, inFile: unknown, scope: unknown,
+  ): Promise<IpcResult<Awaited<ReturnType<typeof importEntries>>>> => {
     try {
       if (typeof gameDir !== 'string' || !gameDir.trim()) return err('游戏目录为空');
       if (typeof inFile !== 'string' || !inFile.trim()) return err('导入路径为空');
       if (running) return err('正在翻译中，请等它结束后再导入。');
-      return ok(await importEntries(gameDir, inFile));
+      const file = resolve(inFile);
+      if (!approvedImports.delete(file)) return err('导入路径未经文件选择器确认');
+      return ok(await importEntries(gameDir, file, (scope ?? {}) as WorkbenchScope));
     } catch (e) {
       return err(e);
     }
   });
 
-  ipcMain.handle(IPC.wbRepackPreview, async (_e, gameDir: unknown): Promise<IpcResult<Awaited<ReturnType<typeof previewRepack>>>> => {
+  ipcMain.handle(IPC.wbRepackPreview, async (
+    _e, gameDir: unknown, scope: unknown,
+  ): Promise<IpcResult<Awaited<ReturnType<typeof previewRepack>>>> => {
     try {
       if (typeof gameDir !== 'string' || !gameDir.trim()) return err('游戏目录为空');
-      return ok(await previewRepack(gameDir));
+      return ok(await previewRepack(gameDir, (scope ?? {}) as WorkbenchScope));
     } catch (e) {
       return err(e);
     }
   });
 
-  ipcMain.handle(IPC.wbRepack, async (_e, gameDir: unknown): Promise<IpcResult<Awaited<ReturnType<typeof repackGame>>>> => {
+  ipcMain.handle(IPC.wbRepack, async (
+    _e, gameDir: unknown, scope: unknown,
+  ): Promise<IpcResult<Awaited<ReturnType<typeof repackGame>>>> => {
     try {
       if (typeof gameDir !== 'string' || !gameDir.trim()) return err('游戏目录为空');
       if (running) return err('正在翻译中，请等它结束后再回写。');
-      const win = getWindow();
-      return ok(await repackGame(gameDir, (p2) => win?.webContents.send(IPC.progress, p2)));
+      return ok(await repackGame(
+        gameDir,
+        (p2) => sendToWindows(windows.getWindows, IPC.progress, p2),
+        (scope ?? {}) as WorkbenchScope,
+      ));
     } catch (e) {
       return err(e);
     }
@@ -450,8 +516,18 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
       return { ok: false, error: '需要游戏目录' };
     }
     try {
+      if (running) return err('静态汉化正在进行，请等待或取消后再启动游戏。');
       const { provider, autoStub, profileName } = pickProvider(undefined);
-      const r = await startRuntime({ gameDir, provider, providerName: profileName, autoStub });
+      const cfg = getConfig();
+      const r = await startRuntime({
+        gameDir,
+        provider,
+        providerName: profileName,
+        autoStub,
+        from: cfg.defaultFrom,
+        to: cfg.defaultTo,
+        batchSize: cfg.batchSize,
+      });
       logInfo('ipc', `一键汉化已启动：${r.engine} · ${r.providerName}`);
       return { ok: true, data: r };
     } catch (e) {
@@ -470,6 +546,80 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
 
   ipcMain.handle(IPC.runtimeStatus, async (): Promise<IpcResult<unknown>> => {
     return { ok: true, data: { ...runtimeStatus(), last: lastRuntimeSummary() } };
+  });
+
+  ipcMain.handle(IPC.floatingOpen, async (): Promise<IpcResult<{ open: boolean }>> => {
+    try {
+      windows.openFloatingWindow();
+      return ok({ open: true });
+    } catch (e) {
+      return err(e);
+    }
+  });
+
+  ipcMain.handle(IPC.floatingClose, async (): Promise<IpcResult<{ open: boolean }>> => {
+    try {
+      windows.closeFloatingWindow();
+      return ok({ open: false });
+    } catch (e) {
+      return err(e);
+    }
+  });
+
+  ipcMain.handle(IPC.floatingStatus, async (): Promise<IpcResult<{ open: boolean; expanded: boolean }>> => {
+    try {
+      return ok({
+        open: windows.isFloatingOpen(),
+        expanded: windows.isFloatingExpanded(),
+      });
+    } catch (e) {
+      return err(e);
+    }
+  });
+
+  ipcMain.handle(IPC.floatingSetExpanded, async (
+    _event,
+    expanded: unknown,
+  ): Promise<IpcResult<{ open: boolean; expanded: boolean }>> => {
+    try {
+      if (typeof expanded !== 'boolean') return err('悬浮窗状态无效');
+      const changed = windows.setFloatingExpanded(expanded);
+      if (!changed) return err('悬浮窗尚未开启');
+      return ok({ open: true, expanded });
+    } catch (e) {
+      return err(e);
+    }
+  });
+
+  ipcMain.handle(IPC.floatingSetPosition, async (
+    _event,
+    x: unknown,
+    y: unknown,
+  ): Promise<IpcResult<{ moved: boolean }>> => {
+    try {
+      if (
+        typeof x !== 'number'
+        || typeof y !== 'number'
+        || !Number.isFinite(x)
+        || !Number.isFinite(y)
+      ) {
+        return err('悬浮窗坐标无效');
+      }
+      const moved = windows.setFloatingPosition(x, y);
+      if (!moved) return err('悬浮窗尚未开启');
+      return ok({ moved: true });
+    } catch (e) {
+      return err(e);
+    }
+  });
+
+  ipcMain.handle(IPC.showMainWindow, async (): Promise<IpcResult<{ shown: true }>> => {
+    try {
+      windows.showMainWindow();
+      return ok({ shown: true });
+    } catch (e) {
+      return err(e);
+    }
   });
 
   ipcMain.handle(IPC.reveal, async (_e, p: unknown): Promise<IpcResult<true>> => {
@@ -495,7 +645,7 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
       initPlatform();
       return ok({
         dbPath: dbPath(),
-        hasApiKey: hasApiKeyCfg() || !!process.env['BAIBAO_OPENAI_API_KEY'],
+        hasApiKey: configStatus().hasApiKey || hasApiKeyCfg() || !!process.env['BAIBAO_OPENAI_API_KEY'],
         translating: isTranslating(),
       });
     } catch (e) {

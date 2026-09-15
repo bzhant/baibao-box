@@ -1,4 +1,5 @@
 import { app } from 'electron';
+import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { TextStore } from './store/text-store';
 
@@ -8,6 +9,7 @@ import { TextStore } from './store/text-store';
  */
 
 let store: TextStore | null = null;
+let leases = 0;
 
 /** 文本库路径：放在 userData 下（安装目录只读，不能写数据）。 */
 export function dbPath(): string {
@@ -16,8 +18,21 @@ export function dbPath(): string {
 
 export function initPlatform(): TextStore {
   if (store) return store;
+  mkdirSync(app.getPath('userData'), { recursive: true });
   store = new TextStore(dbPath());
   return store;
+}
+
+/** Service calls share a connection until the last overlapping operation finishes. */
+export function acquirePlatform(): TextStore {
+  const s = initPlatform();
+  leases++;
+  return s;
+}
+
+export function releasePlatform(): void {
+  if (leases > 0) leases--;
+  if (leases === 0) closePlatform();
 }
 
 export function getStore(): TextStore {
@@ -28,4 +43,5 @@ export function getStore(): TextStore {
 export function closePlatform(): void {
   store?.close();
   store = null;
+  leases = 0;
 }

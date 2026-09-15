@@ -1,4 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import Database from 'better-sqlite3';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { TextStore, hashSource } from './text-store';
 import type { TextEntry } from '@shared/contracts';
 
@@ -152,6 +156,39 @@ describe('TextStore', () => {
     const g = store.getGame('g1');
     expect(g?.title).toBe('测试游戏');
     expect(g?.engineId).toBe('mvmz');
+    expect(g?.translationScope).toBe('ja>zh-CN');
+
+    store.ensureGame('g1', { translationScope: 'ja>en' });
+    expect(store.getGame('g1')?.translationScope).toBe('ja>en');
+  });
+
+  it('可修复列已创建但版本号未更新的半迁移数据库', () => {
+    const root = mkdtempSync(join(tmpdir(), 'baibao-schema-'));
+    const path = join(root, 'half-migrated.db');
+    const db = new Database(path);
+    db.exec(`
+      CREATE TABLE game (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        dir TEXT NOT NULL,
+        engine_id TEXT,
+        engine_version TEXT,
+        added_at INTEGER NOT NULL,
+        translation_scope TEXT NOT NULL DEFAULT 'ja>zh-CN'
+      );
+      PRAGMA user_version = 1;
+    `);
+    db.close();
+
+    const migrated = new TextStore(path);
+    migrated.ensureGame('g1', { translationScope: 'ja>en' });
+    expect(migrated.getGame('g1')?.translationScope).toBe('ja>en');
+    migrated.close();
+
+    const verified = new Database(path, { readonly: true });
+    expect(verified.pragma('user_version', { simple: true })).toBe(2);
+    verified.close();
+    rmSync(root, { recursive: true, force: true });
   });
 
   it('hashSource 稳定且区分大小写内容', () => {

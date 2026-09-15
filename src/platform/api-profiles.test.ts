@@ -110,6 +110,29 @@ describe('归一 / 迁移', () => {
     expect(n.profiles[0].model).toBe('');
   });
 
+  it('用户粘贴完整 chat/completions 地址时自动归一，避免重复拼接', () => {
+    const p = normalizeProfile({
+      id: 'x',
+      name: 'X',
+      baseUrl: 'https://example.com/v1/chat/completions/',
+      model: 'm',
+    });
+    expect(p?.baseUrl).toBe('https://example.com/v1');
+  });
+
+  it('重复方案 id 会被修复，避免密钥和编辑状态串到另一套方案', () => {
+    const n = normalizeConfigFile({
+      config: {
+        profiles: [
+          { id: 'same', name: 'A', baseUrl: 'https://a.example/v1', model: 'a' },
+          { id: 'same', name: 'B', baseUrl: 'https://b.example/v1', model: 'b' },
+        ],
+      },
+    });
+    expect(new Set(n.profiles.map((p) => p.id)).size).toBe(2);
+    expect(n.migrated).toBe(true);
+  });
+
   it('非对象 / 空数组等异常输入不抛异常', () => {
     expect(() => normalizeProfile(null)).not.toThrow();
     expect(normalizeProfile(null)).toBeNull();
@@ -153,6 +176,7 @@ describe('增删改', () => {
     expect(validateProfile(base)).toBeTruthy(); // 自定义预置地址为空 → 不合法
 
     expect(validateProfile({ ...base, baseUrl: 'ftp://a', model: 'm' })).toContain('http');
+    expect(validateProfile({ ...base, baseUrl: 'https://user:pass@a/v1', model: 'm' })).toContain('账号');
     expect(validateProfile({ ...base, baseUrl: 'https://a/v1', model: '  ' })).toContain('模型名');
     expect(validateProfile({ ...base, baseUrl: 'https://a/v1', model: 'm', name: ' ' })).toContain('方案名');
     expect(validateProfile({ ...base, baseUrl: 'https://a/v1', model: 'm' })).toBeNull();

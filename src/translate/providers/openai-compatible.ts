@@ -21,6 +21,7 @@ export interface OpenAICompatibleInit {
   offline?: boolean;
   /** 注入自定义 fetch（测试用）；默认全局 fetch */
   fetchFn?: typeof fetch;
+  timeoutMs?: number;
   /** 批量时的请求并发由调用方控制；这里只管构造与解析 */
 }
 
@@ -50,7 +51,7 @@ export function buildBatchPrompt(reqs: readonly TranslateRequest[]): string {
 /** 从模型回复里按 [序号] 拆回各条译文 */
 export function parseBatchReply(text: string, count: number): string[] {
   const out: string[] = new Array(count).fill('');
-  const re = /\[(\d+)\]\s*(.+?)(?=\n\[\d+\]|$)/gs;
+  const re = /^[ \t]*\[(\d+)\][ \t]*([^\n]*(?:\n(?![ \t]*\[\d+\])[^\n]*)*)/gm;
   let m: RegExpExecArray | null;
   while ((m = re.exec(text)) !== null) {
     const i = Number(m[1]);
@@ -59,10 +60,52 @@ export function parseBatchReply(text: string, count: number): string[] {
   return out;
 }
 
+async function readContent(res: Response): Promise<string> {
+  if (!res.headers?.get('content-type')?.includes('text/event-stream')) {
+    const data = await res.json() as { choices?: Array<{ message?: { content?: unknown } }> };
+    const content = data?.choices?.[0]?.message?.content;
+    if (typeof content !== 'string') throw new Error('接口未返回有效的译文内容');
+    return content;
+  }
+  if (!res.body) throw new Error('接口返回了空的流');
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let text = '';
+  const consume = (line: string): void => {
+    if (!line.startsWith('data:')) return;
+    const value = line.slice(5).trim();
+    if (!value || value === '[DONE]') return;
+    const data = JSON.parse(value) as {
+      error?: { message?: string };
+      choices?: Array<{ delta?: { content?: string }; finish_reason?: string }>;
+    };
+    if (data.error) throw new Error(data.error.message ?? '接口流错误');
+    const choice = data.choices?.[0];
+    if (choice?.finish_reason === 'length') throw new Error('模型输出被截断，请减小批大小');
+    if (typeof choice?.delta?.content === 'string') text += choice.delta.content;
+  };
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      buffer += decoder.decode(value, { stream: !done });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
+      for (const line of lines) consume(line.replace(/\r$/, ''));
+      if (done) break;
+    }
+    if (buffer.trim()) consume(buffer);
+    return text;
+  } finally {
+    await reader.cancel().catch(() => undefined);
+    reader.releaseLock();
+  }
+}
+
 export function createOpenAICompatibleProvider(init: OpenAICompatibleInit = {}): TranslationProvider {
   const id = init.id ?? 'openai';
   const displayName = init.displayName ?? 'OpenAI 兼容接口';
-  const baseUrl = (init.baseUrl ?? 'https://api.openai.com/v1').replace(/\/+$/, '');
+  const baseUrl = (init.baseUrl ?? 'https://api.openai.com/v1').trim().replace(/\/+$/, '').replace(/\/chat\/completions$/i, '');
   const model = init.model ?? 'gpt-4o-mini';
   const fetchFn = init.fetchFn ?? globalThis.fetch.bind(globalThis);
 
@@ -71,15 +114,22 @@ export function createOpenAICompatibleProvider(init: OpenAICompatibleInit = {}):
     displayName,
     offline: init.offline ?? false,
 
-    async translate(reqs: TranslateRequest[]): Promise<TranslateResult[]> {
+    async translate(reqs: TranslateRequest[], options = {}): Promise<TranslateResult[]> {
       if (reqs.length === 0) return [];
-      const apiKey = init.apiKey ?? process.env.BAIBAO_OPENAI_API_KEY;
+      const apiKey = (init.apiKey ?? process.env.BAIBAO_OPENAI_API_KEY)?.trim();
       if (!init.offline && !apiKey) {
         throw new Error(`[${id}] 未配置 API Key（BAIBAO_OPENAI_API_KEY）`);
       }
 
+      const controller = new AbortController();
+      const abort = (): void => controller.abort(options.signal?.reason);
+      options.signal?.addEventListener('abort', abort, { once: true });
+      if (options.signal?.aborted) abort();
+      const timeout = setTimeout(() => controller.abort(new Error('翻译请求超时，请检查网络或减小批大小')), init.timeoutMs ?? 60_000);
+      try {
       const res = await fetchFn(`${baseUrl}/chat/completions`, {
         method: 'POST',
+        signal: controller.signal,
         headers: {
           'Content-Type': 'application/json',
           ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
@@ -87,6 +137,7 @@ export function createOpenAICompatibleProvider(init: OpenAICompatibleInit = {}):
         body: JSON.stringify({
           model,
           temperature: 0.2,
+          stream: true,
           messages: [{ role: 'user', content: buildBatchPrompt(reqs) }],
         }),
       });
@@ -94,18 +145,19 @@ export function createOpenAICompatibleProvider(init: OpenAICompatibleInit = {}):
         throw new Error(`[${id}] HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
       }
 
-      const data = (await res.json()) as {
-        choices?: Array<{ message?: { content?: string } }>;
-      };
-      const content = data.choices?.[0]?.message?.content ?? '';
+      const content = await readContent(res);
       const parts = parseBatchReply(content, reqs.length);
 
-      // 拆不出来的条目回退为原文，**绝不丢条目**（由质量层再判）
+      // Missing results remain retryable; never mark an untranslated source as success.
       return reqs.map((r, i) => ({
         id: r.id,
-        translated: parts[i] || r.source,
+        translated: parts[i],
         provider: id,
       }));
+      } finally {
+        clearTimeout(timeout);
+        options.signal?.removeEventListener('abort', abort);
+      }
     },
   };
 }

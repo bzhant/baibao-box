@@ -12,7 +12,7 @@ import type { Database } from 'better-sqlite3';
  *  - FTS 用 external content + 触发器同步，不额外占空间、也不会和主表不一致。
  */
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 const MIGRATION_1 = `
 CREATE TABLE IF NOT EXISTS game (
@@ -64,6 +64,15 @@ CREATE TRIGGER IF NOT EXISTS text_entry_au AFTER UPDATE ON text_entry BEGIN
 END;
 `;
 
+const MIGRATION_2_INDEX = `
+CREATE INDEX IF NOT EXISTS idx_game_translation_scope ON game(translation_scope);
+`;
+
+function hasColumn(db: Database, table: string, column: string): boolean {
+  const columns = db.pragma(`table_info(${table})`) as Array<{ name: string }>;
+  return columns.some((entry) => entry.name === column);
+}
+
 /** 建表/迁移。幂等，可重复调用。 */
 export function migrate(db: Database): void {
   db.pragma('journal_mode = WAL');
@@ -71,8 +80,20 @@ export function migrate(db: Database): void {
 
   const current = db.pragma('user_version', { simple: true }) as number;
   if (current < 1) {
-    db.exec(MIGRATION_1);
-    db.pragma(`user_version = ${SCHEMA_VERSION}`);
+    db.transaction(() => {
+      db.exec(MIGRATION_1);
+      db.pragma('user_version = 1');
+    })();
   }
-  // 后续版本在这里继续追加： if (current < 2) { db.exec(MIGRATION_2); ... }
+  if (current < 2) {
+    db.transaction(() => {
+      // 兼容旧版本在 ALTER 成功、写 user_version 前意外退出留下的半迁移数据库。
+      if (!hasColumn(db, 'game', 'translation_scope')) {
+        db.exec("ALTER TABLE game ADD COLUMN translation_scope TEXT NOT NULL DEFAULT 'ja>zh-CN'");
+      }
+      db.exec(MIGRATION_2_INDEX);
+      db.pragma(`user_version = ${SCHEMA_VERSION}`);
+    })();
+  }
+  // 后续版本在这里继续追加。
 }
